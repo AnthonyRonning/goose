@@ -34,6 +34,49 @@ type ToolCallData = HashMap<
     ),
 >;
 
+fn merge_tool_call_extra(
+    existing: &mut Option<serde_json::Map<String, Value>>,
+    new_extra: &Option<serde_json::Map<String, Value>>,
+) {
+    match (existing.as_mut(), new_extra) {
+        (Some(existing), Some(new_extra)) => {
+            for (key, value) in new_extra {
+                existing.entry(key.clone()).or_insert(value.clone());
+            }
+        }
+        (None, Some(new_extra)) => {
+            *existing = Some(new_extra.clone());
+        }
+        _ => {}
+    }
+}
+
+fn merge_tool_call_delta(
+    tool_call_data: &mut ToolCallData,
+    delta_call: &DeltaToolCall,
+    fallback_index: i32,
+) {
+    let index = delta_call.index.unwrap_or(fallback_index);
+    let entry = tool_call_data
+        .entry(index)
+        .or_insert_with(|| (String::new(), String::new(), String::new(), None));
+
+    if let Some(id) = &delta_call.id {
+        if !id.is_empty() {
+            entry.0 = id.clone();
+        }
+    }
+
+    if let Some(name) = &delta_call.function.name {
+        if !name.is_empty() {
+            entry.1 = name.clone();
+        }
+    }
+
+    entry.2.push_str(&delta_call.function.arguments);
+    merge_tool_call_extra(&mut entry.3, &delta_call.extra);
+}
+
 fn deserialize_null_default_string<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1054,10 +1097,7 @@ where
 
                 if let Some(tool_calls) = &chunk.choices[0].delta.tool_calls {
                     for (position, tool_call) in tool_calls.iter().enumerate() {
-                        if let (Some(id), Some(name)) = (&tool_call.id, &tool_call.function.name) {
-                            let index = tool_call.index.unwrap_or(position as i32);
-                            tool_call_data.insert(index, (id.clone(), name.clone(), tool_call.function.arguments.clone(), tool_call.extra.clone()));
-                        }
+                        merge_tool_call_delta(&mut tool_call_data, tool_call, position as i32);
                     }
                 }
 
@@ -1094,21 +1134,12 @@ where
                                         }
                                     }
                                     if let Some(delta_tool_calls) = &tool_chunk.choices[0].delta.tool_calls {
-                                        for delta_call in delta_tool_calls {
-                                            if let Some(index) = delta_call.index {
-                                                if let Some((_, _, ref mut args, ref mut extra)) = tool_call_data.get_mut(&index) {
-                                                    args.push_str(&delta_call.function.arguments);
-                                                    if extra.is_none() && delta_call.extra.is_some() {
-                                                        *extra = delta_call.extra.clone();
-                                                    } else if let (Some(existing), Some(new_extra)) = (extra.as_mut(), &delta_call.extra) {
-                                                        for (key, value) in new_extra {
-                                                            existing.entry(key.clone()).or_insert(value.clone());
-                                                        }
-                                                    }
-                                                } else if let (Some(id), Some(name)) = (&delta_call.id, &delta_call.function.name) {
-                                                    tool_call_data.insert(index, (id.clone(), name.clone(), delta_call.function.arguments.clone(), delta_call.extra.clone()));
-                                                }
-                                            }
+                                        for (position, delta_call) in delta_tool_calls.iter().enumerate() {
+                                            merge_tool_call_delta(
+                                                &mut tool_call_data,
+                                                delta_call,
+                                                position as i32,
+                                            );
                                         }
                                     }
                                     if tool_chunk.choices[0].finish_reason.is_some() {
@@ -3813,6 +3844,39 @@ data: [DONE]"#;
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].0, "get_weather");
         assert_eq!(tool_calls[0].1, Some(object!({"city": "Paris"})));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_streaming_tool_call_merges_same_index_arguments_from_initial_chunk(
+    ) -> anyhow::Result<()> {
+        let response_lines = concat!(
+            "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"functions.tree:0\",\"type\":\"function\",\"function\":{\"name\":\"tree\"}},{\"index\":0,\"function\":{\"arguments\":\" {\\\"\"}}]},\"finish_reason\":null}]}\n",
+            "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"path\\\": \\\".\\\"\"}}]},\"finish_reason\":null}]}\n",
+            "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\", \\\"depth\\\": 3} \"}}]},\"finish_reason\":null}]}\n",
+            "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n",
+            "data: [DONE]"
+        );
+        let lines: Vec<String> = response_lines.lines().map(|s| s.to_string()).collect();
+        let response_stream = tokio_stream::iter(lines.into_iter().map(Ok));
+        let mut messages = std::pin::pin!(response_to_streaming_message(response_stream));
+
+        let mut tool_calls = Vec::new();
+        while let Some(result) = messages.next().await {
+            let (message, _usage) = result?;
+            if let Some(msg) = message {
+                for content in &msg.content {
+                    if let MessageContent::ToolRequest(request) = content {
+                        let tool_call = request.tool_call.as_ref().expect("tool call should parse");
+                        tool_calls.push((tool_call.name.to_string(), tool_call.arguments.clone()));
+                    }
+                }
+            }
+        }
+
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].0, "tree");
+        assert_eq!(tool_calls[0].1, Some(object!({"path": ".", "depth": 3})));
         Ok(())
     }
 
