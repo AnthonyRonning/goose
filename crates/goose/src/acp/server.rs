@@ -764,17 +764,30 @@ fn extend_chain_membership(
 }
 
 fn pending_tool_call_from_request(tool_request: &ToolRequest) -> PendingToolCall {
-    let tool_name = match &tool_request.tool_call {
-        Ok(tool_call) => tool_call.name.to_string(),
-        Err(_) => "error".to_string(),
+    let (args_value, error_value, fallback_title) = match &tool_request.tool_call {
+        Ok(tool_call) => {
+            let tool_name = tool_call.name.to_string();
+            let args_value = tool_call
+                .arguments
+                .as_ref()
+                .map(|a| serde_json::Value::Object(a.clone()));
+            let fallback_title = summarize_tool_call(&tool_name, args_value.as_ref());
+            (args_value, None, fallback_title)
+        }
+        Err(error) => {
+            let message = error.message.to_string();
+            let error_value = serde_json::json!({
+                "code": error.code.0,
+                "message": message,
+                "data": error.data,
+            });
+            (
+                None,
+                Some(error_value),
+                "Tool call parse failed".to_string(),
+            )
+        }
     };
-    let args_value = tool_request
-        .tool_call
-        .as_ref()
-        .ok()
-        .and_then(|tc| tc.arguments.as_ref())
-        .map(|a| serde_json::Value::Object(a.clone()));
-    let fallback_title = summarize_tool_call(&tool_name, args_value.as_ref());
     let identity_meta = tool_call_identity_meta(tool_request);
 
     // Prefer the persisted LLM-generated title when available so replay (and
@@ -790,6 +803,19 @@ fn pending_tool_call_from_request(tool_request: &ToolRequest) -> PendingToolCall
         .status(ToolCallStatus::Pending);
     if let Some(args) = args_value {
         tool_call = tool_call.raw_input(args);
+    }
+    if let Some(error) = error_value {
+        let message = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Tool call could not be parsed");
+        tool_call = tool_call
+            .status(ToolCallStatus::Failed)
+            .raw_input(error.clone())
+            .raw_output(error.clone())
+            .content(vec![ToolCallContent::Content(Content::new(
+                ContentBlock::Text(TextContent::new(message.to_string())),
+            ))]);
     }
 
     PendingToolCall {
@@ -3081,7 +3107,7 @@ mod tests {
         PermissionOptionId, ResourceLink, SelectedPermissionOutcome,
     };
     use goose_providers::conversation::token_usage::Usage as TokenUsage;
-    use rmcp::model::{CallToolRequestParams, Content as RmcpContent};
+    use rmcp::model::{CallToolRequestParams, Content as RmcpContent, ErrorCode, ErrorData};
     use std::io::Write;
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
@@ -3424,6 +3450,32 @@ print(\"hello, world\")
             chain_summary.is_none(),
             "non-first tool requests must not carry chain summaries",
         );
+    }
+
+    #[test]
+    fn parse_error_tool_request_exposes_acp_diagnostics() {
+        let message = "The model's response was truncated while generating this tool call";
+        let tool_request = ToolRequest {
+            id: "req_parse_error".to_string(),
+            tool_call: Err(ErrorData::new(ErrorCode::INVALID_PARAMS, message, None)),
+            metadata: None,
+            tool_meta: None,
+        };
+
+        let pending = pending_tool_call_from_request(&tool_request);
+
+        assert_eq!(pending.tool_call.title, "Tool call parse failed");
+        assert_eq!(pending.tool_call.status, ToolCallStatus::Failed);
+        assert_eq!(
+            pending.tool_call.raw_input,
+            Some(serde_json::json!({
+                "code": -32602,
+                "message": message,
+                "data": null,
+            }))
+        );
+        assert_eq!(pending.tool_call.raw_output, pending.tool_call.raw_input);
+        assert_eq!(pending.tool_call.content.len(), 1);
     }
 
     #[test]
