@@ -48,14 +48,14 @@ impl PendingResponseClaim {
 
 pub(crate) struct ActionRequiredManager {
     pending: Arc<RwLock<HashMap<String, Arc<Mutex<PendingRequest>>>>>,
-    action_required_senders: Mutex<HashMap<(String, String), mpsc::Sender<Message>>>,
+    action_required_senders: std::sync::Mutex<HashMap<(String, String), mpsc::Sender<Message>>>,
 }
 
 impl ActionRequiredManager {
     pub(crate) fn new() -> Self {
         Self {
             pending: Arc::new(RwLock::new(HashMap::new())),
-            action_required_senders: Mutex::new(HashMap::new()),
+            action_required_senders: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -70,7 +70,7 @@ impl ActionRequiredManager {
         let sender = self
             .action_required_senders
             .lock()
-            .await
+            .expect("action_required_senders mutex poisoned")
             .get(&(session_id.clone(), tool_call_request_id.clone()))
             .cloned();
 
@@ -149,6 +149,48 @@ impl ActionRequiredManager {
         })
     }
 
+    /// Push an already-created action-required message into the stream of
+    /// the given tool call. Unlike [`ActionRequiredManager::request_and_wait`]
+    /// this does not track a pending response: it only delivers the message,
+    /// which is what subagent forwarding needs (the response routes back
+    /// through the caller's own confirmation router).
+    pub(crate) fn forward_action_required(
+        &self,
+        session_id: &str,
+        tool_call_request_id: &str,
+        message: Message,
+    ) -> Result<()> {
+        let senders = self
+            .action_required_senders
+            .lock()
+            .expect("action_required_senders mutex poisoned");
+        let sender = senders
+            .get(&(session_id.to_string(), tool_call_request_id.to_string()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No action-required stream for session {session_id} tool call {tool_call_request_id}"
+                )
+            })?;
+        sender.try_send(message).map_err(|e| {
+            anyhow::anyhow!("Tool call action-required stream error: {tool_call_request_id}: {e}")
+        })
+    }
+
+    /// Re-home a pending elicitation under a different session so the
+    /// surface that received a forwarded elicitation can claim its
+    /// response. Used when a subagent's elicitation is forwarded to a
+    /// parent session's client.
+    pub(crate) async fn rekey_pending_request(
+        &self,
+        request_id: &str,
+        parent_session_id: &str,
+    ) -> Result<()> {
+        let pending = self.pending_request(request_id).await?;
+        let mut request = pending.lock_owned().await;
+        request.session_id = parent_session_id.to_string();
+        Ok(())
+    }
+
     async fn pending_request(&self, request_id: &str) -> Result<Arc<Mutex<PendingRequest>>> {
         let pending = self.pending.read().await;
         pending
@@ -201,7 +243,7 @@ impl ActionRequiredManager {
         let (tx, rx) = mpsc::channel(ACTION_REQUIRED_STREAM_CAPACITY);
         self.action_required_senders
             .lock()
-            .await
+            .expect("action_required_senders mutex poisoned")
             .insert((session_id, tool_call_request_id), tx);
         rx
     }
@@ -213,7 +255,7 @@ impl ActionRequiredManager {
     ) -> bool {
         self.action_required_senders
             .lock()
-            .await
+            .expect("action_required_senders mutex poisoned")
             .contains_key(&(session_id.to_string(), tool_call_request_id.to_string()))
     }
 
@@ -224,7 +266,7 @@ impl ActionRequiredManager {
     ) {
         self.action_required_senders
             .lock()
-            .await
+            .expect("action_required_senders mutex poisoned")
             .remove(&(session_id.to_string(), tool_call_request_id.to_string()));
     }
 }

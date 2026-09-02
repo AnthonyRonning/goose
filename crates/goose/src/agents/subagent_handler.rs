@@ -21,6 +21,13 @@ use tracing::{debug, info};
 
 pub type OnMessageCallback = Arc<dyn Fn(&Message) + Send + Sync>;
 
+/// Forwards action-required messages (tool confirmations, elicitations) from
+/// a subagent to the session surface that is driving the parent agent. The
+/// async form keeps per-message ordering: each message is fully delivered
+/// before the next one is forwarded.
+pub type ActionRequiredForwarder =
+    Arc<dyn Fn(&Message) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 #[derive(Serialize)]
 pub struct SubagentPromptContext {
     pub max_turns: usize,
@@ -41,6 +48,7 @@ pub struct SubagentRunParams {
     pub cancellation_token: Option<CancellationToken>,
     pub on_message: Option<OnMessageCallback>,
     pub notification_tx: Option<tokio::sync::mpsc::UnboundedSender<ServerNotification>>,
+    pub action_required_forwarder: Option<ActionRequiredForwarder>,
 }
 
 pub async fn run_subagent_task(params: SubagentRunParams) -> Result<String, anyhow::Error> {
@@ -127,6 +135,7 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             cancellation_token,
             on_message,
             notification_tx,
+            action_required_forwarder,
             ..
         } = params;
 
@@ -212,6 +221,15 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
                 Ok(AgentEvent::Message(msg)) => {
                     if let Some(ref callback) = on_message {
                         callback(&msg);
+                    }
+                    if let Some(ref forwarder) = action_required_forwarder {
+                        if msg
+                            .content
+                            .iter()
+                            .any(|c| matches!(c, MessageContent::ActionRequired(_)))
+                        {
+                            forwarder(&msg).await;
+                        }
                     }
                     if let Some(ref tx) = notification_tx {
                         for content in &msg.content {

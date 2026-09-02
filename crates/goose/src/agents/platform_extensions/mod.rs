@@ -15,6 +15,7 @@ pub mod tom;
 use std::collections::HashMap;
 
 use crate::agents::mcp_client::McpClientTrait;
+use crate::agents::tool_confirmation_router::ToolConfirmationRouter;
 use crate::session::Session;
 use once_cell::sync::Lazy;
 
@@ -234,6 +235,9 @@ pub struct PlatformExtensionContext {
     pub scheduler: Option<std::sync::Arc<dyn crate::scheduler_trait::SchedulerTrait>>,
     pub session: Option<std::sync::Arc<Session>>,
     pub use_login_shell_path: bool,
+    /// The owning agent's confirmation router. Platform extensions that spawn
+    /// subagents share it so subagent approvals are deliverable via the parent.
+    pub tool_confirmation_router: Option<ToolConfirmationRouter>,
 }
 
 impl PlatformExtensionContext {

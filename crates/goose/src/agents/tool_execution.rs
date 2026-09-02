@@ -168,14 +168,31 @@ impl Agent {
                         }
                     });
 
+                // Subagent confirmations share the parent's
+                // ToolConfirmationRouter. Namespace request IDs within the
+                // parent's session so a subagent request cannot collide with
+                // the parent's or another subagent's request.
+                let confirmation_id = if self.config.is_subagent {
+                    format!("{}:{}", session.id, request.id)
+                } else {
+                    request.id.clone()
+                };
+
                 let confirmation_rx = self
                     .tool_confirmation_router
-                    .register(session.id.clone(), request.id.clone())
+                    .register(
+                        self.config
+                            .confirmation_session_id
+                            .as_ref()
+                            .unwrap_or(&session.id)
+                            .clone(),
+                        confirmation_id.clone(),
+                    )
                     .await;
 
                 let action_required_msg = Message::assistant()
                     .with_action_required(
-                        request.id.clone(),
+                        confirmation_id,
                         tool_call.name.to_string().clone(),
                         tool_call.arguments.clone().unwrap_or_default(),
                         security_message,
