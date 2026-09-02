@@ -1,11 +1,15 @@
 use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::mcp_client::{Error, McpClientTrait};
-use crate::agents::subagent_handler::{run_subagent_task, OnMessageCallback, SubagentRunParams};
+use crate::agents::subagent_handler::{
+    run_subagent_task, ActionRequiredForwarder, OnMessageCallback, SubagentRunParams,
+};
 use crate::agents::subagent_task_config::{TaskConfig, DEFAULT_SUBAGENT_MAX_TURNS};
+use crate::agents::tool_confirmation_router::ToolConfirmationRouter;
 use crate::agents::tool_execution::{ToolCallContext, ToolCallNotificationEmitter};
 use crate::agents::AgentConfig;
 use crate::config::paths::Paths;
 use crate::config::{Config, GooseMode};
+use crate::conversation::message::{ActionRequiredData, Message, MessageContent};
 use crate::providers;
 use crate::recipe::build_recipe::build_recipe_from_template;
 use crate::recipe::local_recipes::load_local_recipe_file;
@@ -101,6 +105,7 @@ pub struct BackgroundTask {
     pub cancellation_token: CancellationToken,
     completion_token: CancellationToken,
     notification_sink: SharedNotificationSink,
+    action_required_sink: ActionRequiredSink,
 }
 
 fn spawn_background_task<F>(future: F) -> (JoinHandle<Result<String>>, CancellationToken)
@@ -174,6 +179,112 @@ impl NotificationSink {
         match self {
             Self::Buffer(buffer) => buffer.len(),
             Self::Emitter(_) => 0,
+        }
+    }
+}
+
+/// Routes subagent action-required messages (tool confirmations,
+/// elicitations) to the surface that is driving the parent agent. While no
+/// target is attached (a background delegate before its `load` call, or a
+/// detached wait), messages buffer. Attaching points the sink at a parent
+/// tool call's action-required stream so the parent's client sees the
+/// permission requests; answers route back through the parent's shared
+/// tool-confirmation router.
+#[derive(Clone)]
+struct ActionRequiredSink {
+    manager: std::sync::Arc<crate::action_required_manager::ActionRequiredManager>,
+    state: std::sync::Arc<std::sync::Mutex<ActionRequiredSinkState>>,
+}
+
+enum ActionRequiredSinkState {
+    Buffer(Vec<Message>),
+    Live {
+        session_id: String,
+        tool_call_request_id: String,
+    },
+}
+
+impl ActionRequiredSink {
+    fn new(manager: std::sync::Arc<crate::action_required_manager::ActionRequiredManager>) -> Self {
+        Self {
+            manager,
+            state: std::sync::Arc::new(std::sync::Mutex::new(ActionRequiredSinkState::Buffer(
+                Vec::new(),
+            ))),
+        }
+    }
+
+    fn send(&self, message: Message) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("action-required sink mutex poisoned");
+        match &*state {
+            ActionRequiredSinkState::Live {
+                session_id,
+                tool_call_request_id,
+            } => {
+                let delivered = self
+                    .manager
+                    .forward_action_required(session_id, tool_call_request_id, message.clone())
+                    .is_ok();
+                if delivered {
+                    return;
+                }
+                // The parent stream went away (e.g. the parent turn was
+                // cancelled). Buffer for the next attach so ordering holds.
+                *state = ActionRequiredSinkState::Buffer(vec![message]);
+            }
+            ActionRequiredSinkState::Buffer(_) => {
+                if let ActionRequiredSinkState::Buffer(buffer) = &mut *state {
+                    buffer.push(message);
+                }
+            }
+        }
+    }
+
+    fn attach(&self, session_id: String, tool_call_request_id: String) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("action-required sink mutex poisoned");
+        let buffered = std::mem::replace(
+            &mut *state,
+            ActionRequiredSinkState::Live {
+                session_id,
+                tool_call_request_id,
+            },
+        );
+        if let ActionRequiredSinkState::Buffer(buffered) = buffered {
+            let mut undelivered = Vec::new();
+            if let ActionRequiredSinkState::Live {
+                session_id,
+                tool_call_request_id,
+            } = &*state
+            {
+                for message in buffered {
+                    let delivered = self
+                        .manager
+                        .forward_action_required(session_id, tool_call_request_id, message.clone())
+                        .is_ok();
+                    if !delivered {
+                        undelivered.push(message);
+                    }
+                }
+            }
+            if !undelivered.is_empty() {
+                *state = ActionRequiredSinkState::Buffer(undelivered);
+            }
+        }
+    }
+
+    fn detach(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("action-required sink mutex poisoned");
+        if matches!(&*state, ActionRequiredSinkState::Live { .. }) {
+            *state = ActionRequiredSinkState::Buffer(Vec::new());
         }
     }
 }
@@ -607,11 +718,66 @@ impl SummonClient {
         })
     }
 
+    async fn parent_goose_mode(&self, parent_session_id: &str) -> GooseMode {
+        self.context
+            .session_manager
+            .get_session(parent_session_id, false)
+            .await
+            .map(|session| session.goose_mode)
+            .unwrap_or(GooseMode::Auto)
+    }
+
+    /// The parent agent's confirmation router, when this client belongs to an
+    /// agent's extension manager. Subagents share it so confirmations
+    /// delivered to the parent reach the subagent awaiting them.
+    fn parent_tool_confirmation_router(&self) -> Option<ToolConfirmationRouter> {
+        self.context.tool_confirmation_router.clone()
+    }
+
+    /// Builds the forwarder that surfaces a subagent's action-required
+    /// messages on the parent session's surface.
+    ///
+    /// Elicitations are re-homed under the parent session so responses the
+    /// parent's client sends are accepted; tool confirmations already carry
+    /// a subagent-namespaced id (see `handle_approval_tool_requests`) and are
+    /// answered through the shared confirmation router.
+    fn action_required_forwarder(
+        &self,
+        sink: ActionRequiredSink,
+        parent_session_id: &str,
+    ) -> ActionRequiredForwarder {
+        let manager = self.context.session_manager.action_required();
+        let parent_session_id = parent_session_id.to_string();
+        Arc::new(move |message| {
+            let manager = manager.clone();
+            let sink = sink.clone();
+            let parent_session_id = parent_session_id.clone();
+            let message = message.clone();
+            Box::pin(async move {
+                for content in &message.content {
+                    if let MessageContent::ActionRequired(action) = content {
+                        if let ActionRequiredData::Elicitation { id, .. } = &action.data {
+                            if let Err(e) =
+                                manager.rekey_pending_request(id, &parent_session_id).await
+                            {
+                                warn!("Failed to rehome subagent elicitation {id}: {e}");
+                            }
+                        }
+                    }
+                }
+                sink.send(message);
+            })
+        })
+    }
+
     async fn create_subagent_session(
         &self,
         task_config: &TaskConfig,
         name: String,
+        goose_mode: GooseMode,
     ) -> Result<crate::session::Session, String> {
+        // Subagents inherit the parent session's mode so approval flow
+        // surfaces to the parent's client (see delegate handling below).
         let session = self
             .context
             .session_manager
@@ -619,7 +785,7 @@ impl SummonClient {
                 task_config.parent_working_dir.clone(),
                 name,
                 SessionType::SubAgent,
-                GooseMode::Auto,
+                goose_mode,
             )
             .await
             .map_err(|e| format!("Failed to create subagent session: {}", e))?;
@@ -980,6 +1146,7 @@ impl SummonClient {
         session_id: &str,
         arguments: Option<JsonObject>,
         notification_emitter: Option<ToolCallNotificationEmitter>,
+        tool_call_request_id: Option<String>,
     ) -> Result<CallToolResult, String> {
         self.cleanup_completed_tasks().await;
 
@@ -1013,7 +1180,14 @@ impl SummonClient {
 
         if is_session_id(name) {
             let task_result = self
-                .handle_load_task_result(name, cancel, peek, notification_emitter)
+                .handle_load_task_result(
+                    session_id,
+                    name,
+                    cancel,
+                    peek,
+                    notification_emitter,
+                    tool_call_request_id,
+                )
                 .await?;
             let mut meta = MetaObject::new();
             meta.0.insert(
@@ -1046,10 +1220,12 @@ impl SummonClient {
 
     async fn handle_load_task_result(
         &self,
+        session_id: &str,
         task_id: &str,
         cancel: bool,
         peek: bool,
         notification_emitter: Option<ToolCallNotificationEmitter>,
+        tool_call_request_id: Option<String>,
     ) -> Result<TaskLoadResult, String> {
         let mut completed = self.completed_tasks.lock().await;
 
@@ -1198,6 +1374,12 @@ impl SummonClient {
             let task = running.get(task_id).unwrap();
             let notification_sink = Arc::clone(&task.notification_sink);
             let completion_token = task.completion_token.clone();
+            let action_required_sink = task.action_required_sink.clone();
+            // Surface any subagent approval requests through this load call
+            // so the parent's client can answer them.
+            if let Some(request_id) = tool_call_request_id {
+                action_required_sink.attach(session_id.to_string(), request_id);
+            }
             drop(running);
             Self::attach_notification_emitter(&notification_sink, notification_emitter).await;
 
@@ -1205,12 +1387,13 @@ impl SummonClient {
                 _ = self.wait_for_background_task_completion(task_id, &completion_token) => {
                     self.cleanup_completed_tasks().await;
                     return Box::pin(
-                        self.handle_load_task_result(task_id, false, false, None)
+                        self.handle_load_task_result(session_id, task_id, false, false, None, None)
                     )
                     .await;
                 }
                 _ = tokio::time::sleep(Duration::from_secs(300)) => {
                     notification_sink.lock().await.detach();
+                    action_required_sink.detach();
 
                     return Err(format!(
                         "Task '{task_id}' is still running after waiting 5 min. \
@@ -1348,6 +1531,7 @@ impl SummonClient {
         arguments: Option<JsonObject>,
         cancellation_token: CancellationToken,
         notification_emitter: Option<ToolCallNotificationEmitter>,
+        tool_call_request_id: Option<String>,
     ) -> Result<CallToolResult, String> {
         self.cleanup_completed_tasks().await;
 
@@ -1390,25 +1574,37 @@ impl SummonClient {
             .await
             .map_err(|e| format!("Failed to build task config: {}", e))?;
 
-        // Subagents must use Auto until get_agent_messages forwards
-        // ActionRequired messages to the parent. Until then, any mode
-        // that requires approval will hang on the subagent's confirmation_rx.
+        // Subagents inherit the parent's permission mode. Action-required
+        // messages (tool confirmations, elicitations) are forwarded to the
+        // delegate tool call's stream, so modes that require approval no
+        // longer hang; the parent's client answers them.
+        let parent_mode = self.parent_goose_mode(session_id).await;
+        let tool_confirmation_router = self.parent_tool_confirmation_router();
         let mut agent_config = AgentConfig::new(
             self.context.session_manager.clone(),
             crate::config::permission::PermissionManager::instance(),
             None,
-            GooseMode::Auto,
+            parent_mode,
             true, // disable session naming for subagents
             crate::agents::GoosePlatform::GooseCli,
         )
-        .with_use_login_shell_path(self.context.use_login_shell_path);
+        .with_use_login_shell_path(self.context.use_login_shell_path)
+        .with_tool_confirmation_router(tool_confirmation_router)
+        .with_confirmation_session_id(session_id.to_string());
         agent_config.is_subagent = true;
 
         let subagent_session = self
-            .create_subagent_session(&task_config, "Delegated task".to_string())
+            .create_subagent_session(&task_config, "Delegated task".to_string(), parent_mode)
             .await?;
 
         let subagent_session_id = subagent_session.id.clone();
+
+        let action_required_sink =
+            ActionRequiredSink::new(self.context.session_manager.action_required());
+        if let Some(tool_call_request_id) = tool_call_request_id {
+            action_required_sink.attach(session_id.to_string(), tool_call_request_id);
+        }
+        let forwarder = self.action_required_forwarder(action_required_sink, session_id);
 
         let params = SubagentRunParams {
             config: agent_config,
@@ -1419,6 +1615,7 @@ impl SummonClient {
             cancellation_token: Some(cancellation_token),
             on_message: None,
             notification_tx: None,
+            action_required_forwarder: Some(forwarder),
         };
         let result = Self::run_subagent_with_notifications(
             Self::notification_sink(notification_emitter),
@@ -2065,22 +2262,27 @@ impl SummonClient {
 
         let description = safe_truncate(&Self::get_task_description(&params), TASK_LABEL_BUDGET);
 
-        // Subagents must use Auto until get_agent_messages forwards
-        // ActionRequired messages to the parent. Until then, any mode
-        // that requires approval will hang on the subagent's confirmation_rx.
+        // Subagents inherit the parent's permission mode. Action-required
+        // messages (tool confirmations, elicitations) buffer in the task's
+        // action-required sink and surface when `load` attaches to the
+        // parent's client.
+        let parent_mode = self.parent_goose_mode(session_id).await;
+        let tool_confirmation_router = self.parent_tool_confirmation_router();
         let mut agent_config = AgentConfig::new(
             self.context.session_manager.clone(),
             crate::config::permission::PermissionManager::instance(),
             None,
-            GooseMode::Auto,
+            parent_mode,
             true, // disable session naming for subagents
             crate::agents::GoosePlatform::GooseCli,
         )
-        .with_use_login_shell_path(self.context.use_login_shell_path);
+        .with_use_login_shell_path(self.context.use_login_shell_path)
+        .with_tool_confirmation_router(tool_confirmation_router)
+        .with_confirmation_session_id(session_id.to_string());
         agent_config.is_subagent = true;
 
         let subagent_session = self
-            .create_subagent_session(&task_config, description.clone())
+            .create_subagent_session(&task_config, description.clone(), parent_mode)
             .await?;
 
         let task_id = subagent_session.id.clone();
@@ -2100,6 +2302,11 @@ impl SummonClient {
         let notification_sink = Self::notification_sink(None);
         let task_notification_sink = Arc::clone(&notification_sink);
 
+        let action_required_sink =
+            ActionRequiredSink::new(self.context.session_manager.action_required());
+        let task_action_required_sink = action_required_sink.clone();
+        let forwarder = self.action_required_forwarder(action_required_sink, session_id);
+
         let (handle, completion_token) = spawn_background_task(async move {
             let params = SubagentRunParams {
                 config: agent_config,
@@ -2110,6 +2317,7 @@ impl SummonClient {
                 cancellation_token: Some(task_token_clone),
                 on_message: Some(on_message),
                 notification_tx: None,
+                action_required_forwarder: Some(forwarder),
             };
             Self::run_subagent_with_notifications(task_notification_sink, move |notification_tx| {
                 let mut params = params;
@@ -2129,6 +2337,7 @@ impl SummonClient {
             cancellation_token: task_token,
             completion_token,
             notification_sink,
+            action_required_sink: task_action_required_sink,
         };
 
         self.background_tasks
@@ -2187,7 +2396,12 @@ impl McpClientTrait for SummonClient {
         let session_id = &ctx.session_id;
         match name {
             "load" => match self
-                .handle_load(session_id, arguments, ctx.notification_emitter().cloned())
+                .handle_load(
+                    session_id,
+                    arguments,
+                    ctx.notification_emitter().cloned(),
+                    ctx.tool_call_request_id.clone(),
+                )
                 .await
             {
                 Ok(result) => Ok(result),
@@ -2203,6 +2417,7 @@ impl McpClientTrait for SummonClient {
                         arguments,
                         cancellation_token,
                         ctx.notification_emitter().cloned(),
+                        ctx.tool_call_request_id.clone(),
                     )
                     .await
                 {
@@ -2357,6 +2572,7 @@ mod tests {
             scheduler: None,
             session: None,
             use_login_shell_path: false,
+            tool_confirmation_router: None,
         }
     }
 
@@ -2382,6 +2598,8 @@ mod tests {
         }
         session.id
     }
+
+    const TEST_SESSION_ID: &str = "test-session-id";
 
     #[test]
     fn test_agent_frontmatter_parsing() {
@@ -3629,7 +3847,14 @@ You review code."#;
             futures::stream::empty(),
             async move {
                 let result = load_client
-                    .handle_load_task_result(task_id, false, false, Some(emitter))
+                    .handle_load_task_result(
+                        TEST_SESSION_ID,
+                        task_id,
+                        false,
+                        false,
+                        Some(emitter),
+                        None,
+                    )
                     .await
                     .unwrap();
                 Ok::<_, rmcp::model::ErrorData>(CallToolResult::success(result.content))
@@ -3678,7 +3903,14 @@ You review code."#;
         let load_client = Arc::clone(&client);
         let load = tokio::spawn(async move {
             load_client
-                .handle_load_task_result(task_id, false, false, Some(emitter))
+                .handle_load_task_result(
+                    TEST_SESSION_ID,
+                    task_id,
+                    false,
+                    false,
+                    Some(emitter),
+                    None,
+                )
                 .await
         });
 
@@ -3690,7 +3922,14 @@ You review code."#;
 
         let (retry_emitter, mut retry_notifications) = notification_channel();
         let result = client
-            .handle_load_task_result(task_id, false, false, Some(retry_emitter))
+            .handle_load_task_result(
+                TEST_SESSION_ID,
+                task_id,
+                false,
+                false,
+                Some(retry_emitter),
+                None,
+            )
             .await
             .unwrap();
 
@@ -3751,7 +3990,14 @@ You review code."#;
 
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            client.handle_load_task_result(task_id, false, false, Some(emitter)),
+            client.handle_load_task_result(
+                TEST_SESSION_ID,
+                task_id,
+                false,
+                false,
+                Some(emitter),
+                None,
+            ),
         )
         .await
         .expect("load must not wait for a notification consumer")
@@ -3766,7 +4012,7 @@ You review code."#;
         let temp_dir = TempDir::new().unwrap();
 
         let result = client
-            .handle_load_task_result("20260204_999", false, false, None)
+            .handle_load_task_result(TEST_SESSION_ID, "20260204_999", false, false, None, None)
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
@@ -3792,13 +4038,23 @@ You review code."#;
                     cancellation_token: CancellationToken::new(),
                     completion_token,
                     notification_sink,
+                    action_required_sink: ActionRequiredSink::new(
+                        Arc::new(crate::session::SessionManager::instance()).action_required(),
+                    ),
                 },
             );
         }
 
         let (emitter, mut notifications) = notification_channel();
         let (result, notification) = tokio::join!(
-            client.handle_load_task_result("20260204_1", false, false, Some(emitter)),
+            client.handle_load_task_result(
+                TEST_SESSION_ID,
+                "20260204_1",
+                false,
+                false,
+                Some(emitter),
+                None
+            ),
             notifications.recv()
         );
         let result = result.expect("load should wait and return result");
@@ -3862,7 +4118,7 @@ You review code."#;
         assert!(discovery_text.contains("20260204_3"));
 
         let result = client
-            .handle_load_task_result("20260204_2", false, false, None)
+            .handle_load_task_result(TEST_SESSION_ID, "20260204_2", false, false, None, None)
             .await
             .unwrap();
         let text = extract_text(&result.content[0]);
@@ -3882,7 +4138,7 @@ You review code."#;
             .contains_key("20260204_2"));
 
         let result = client
-            .handle_load_task_result("20260204_3", false, false, None)
+            .handle_load_task_result(TEST_SESSION_ID, "20260204_3", false, false, None, None)
             .await
             .unwrap();
         let text = extract_text(&result.content[0]);
@@ -3891,7 +4147,7 @@ You review code."#;
         assert_eq!(result.status, "failed");
 
         let result = client
-            .handle_load_task_result("20260204_3", false, false, None)
+            .handle_load_task_result(TEST_SESSION_ID, "20260204_3", false, false, None, None)
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
@@ -4075,13 +4331,23 @@ You review code."#;
                     cancellation_token: token.clone(),
                     completion_token: CancellationToken::new(),
                     notification_sink,
+                    action_required_sink: ActionRequiredSink::new(
+                        Arc::new(crate::session::SessionManager::instance()).action_required(),
+                    ),
                 },
             );
         }
 
         let (emitter, mut notifications) = notification_channel();
         let (result, notification) = tokio::join!(
-            client.handle_load_task_result(&task_id, true, false, Some(emitter)),
+            client.handle_load_task_result(
+                TEST_SESSION_ID,
+                &task_id,
+                true,
+                false,
+                Some(emitter),
+                None,
+            ),
             notifications.recv()
         );
         let result = result.unwrap();
@@ -4125,6 +4391,9 @@ You review code."#;
                     test_tool_notification("inner-0", task_id),
                     test_tool_notification("inner-1", task_id),
                 ]),
+                action_required_sink: ActionRequiredSink::new(
+                    Arc::new(crate::session::SessionManager::instance()).action_required(),
+                ),
             },
         );
 
@@ -4132,7 +4401,7 @@ You review code."#;
         let load_client = Arc::clone(&client);
         let load = tokio::spawn(async move {
             load_client
-                .handle_load_task_result(task_id, true, false, Some(emitter))
+                .handle_load_task_result(TEST_SESSION_ID, task_id, true, false, Some(emitter), None)
                 .await
         });
 
@@ -4145,7 +4414,14 @@ You review code."#;
 
         let (retry_emitter, mut retry_notifications) = notification_channel();
         let result = client
-            .handle_load_task_result(task_id, true, false, Some(retry_emitter))
+            .handle_load_task_result(
+                TEST_SESSION_ID,
+                task_id,
+                true,
+                false,
+                Some(retry_emitter),
+                None,
+            )
             .await
             .unwrap();
 
@@ -4187,6 +4463,9 @@ You review code."#;
                     test_tool_notification("inner-0", task_id),
                     test_tool_notification("inner-1", task_id),
                 ]),
+                action_required_sink: ActionRequiredSink::new(
+                    Arc::new(crate::session::SessionManager::instance()).action_required(),
+                ),
             },
         );
 
@@ -4194,7 +4473,14 @@ You review code."#;
         let load_client = Arc::clone(&client);
         let load = tokio::spawn(async move {
             load_client
-                .handle_load_task_result(task_id, false, false, Some(emitter))
+                .handle_load_task_result(
+                    TEST_SESSION_ID,
+                    task_id,
+                    false,
+                    false,
+                    Some(emitter),
+                    None,
+                )
                 .await
         });
 
@@ -4207,7 +4493,14 @@ You review code."#;
         finish_tx.send(()).unwrap();
         let (retry_emitter, mut retry_notifications) = notification_channel();
         let result = client
-            .handle_load_task_result(task_id, false, false, Some(retry_emitter))
+            .handle_load_task_result(
+                TEST_SESSION_ID,
+                task_id,
+                false,
+                false,
+                Some(retry_emitter),
+                None,
+            )
             .await
             .unwrap();
 
@@ -4331,6 +4624,9 @@ You review code."#;
                     cancellation_token: CancellationToken::new(),
                     completion_token: CancellationToken::new(),
                     notification_sink: buffered_notification_sink(Vec::new()),
+                    action_required_sink: ActionRequiredSink::new(
+                        Arc::new(crate::session::SessionManager::instance()).action_required(),
+                    ),
                 },
             );
         }
@@ -4363,7 +4659,7 @@ You review code."#;
 
         // Peek should return status without removing the task
         let result = client
-            .handle_load_task_result(&task_id, false, true, None)
+            .handle_load_task_result(TEST_SESSION_ID, &task_id, false, true, None, None)
             .await
             .unwrap();
         let text = extract_text(&result.content[0]);
@@ -4384,7 +4680,7 @@ You review code."#;
         let client = SummonClient::new(create_test_context()).unwrap();
 
         let result = client
-            .handle_load_task_result("20260204_999", false, true, None)
+            .handle_load_task_result(TEST_SESSION_ID, "20260204_999", false, true, None, None)
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
@@ -4412,7 +4708,7 @@ You review code."#;
 
         // Peek on a completed task should return the full result (same as non-peek)
         let result = client
-            .handle_load_task_result("20260204_1", false, true, None)
+            .handle_load_task_result(TEST_SESSION_ID, "20260204_1", false, true, None, None)
             .await
             .unwrap();
         let text = extract_text(&result.content[0]);
@@ -4426,7 +4722,7 @@ You review code."#;
             .await
             .contains_key("20260204_1"));
         let result = client
-            .handle_load_task_result("20260204_1", false, false, None)
+            .handle_load_task_result(TEST_SESSION_ID, "20260204_1", false, false, None, None)
             .await
             .unwrap();
         assert!(extract_text(&result.content[0]).contains("final output"));

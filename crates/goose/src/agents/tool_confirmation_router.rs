@@ -1,18 +1,31 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use tokio::sync::{oneshot, Mutex};
 use tracing::warn;
 
 use crate::permission::PermissionConfirmation;
 
-pub(super) struct ToolConfirmationRouter {
-    pending: Mutex<HashMap<(String, String), oneshot::Sender<PermissionConfirmation>>>,
+/// Routes permission confirmations to the awaiting tool request.
+///
+/// Clones share the same pending map, which lets subagents register their
+/// confirmations in the parent's router so confirmations delivered to the
+/// parent agent reach the subagent that is waiting for them.
+#[derive(Clone)]
+pub struct ToolConfirmationRouter {
+    pending: Arc<Mutex<HashMap<(String, String), oneshot::Sender<PermissionConfirmation>>>>,
+}
+
+impl Default for ToolConfirmationRouter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ToolConfirmationRouter {
     pub(super) fn new() -> Self {
         Self {
-            pending: Mutex::new(HashMap::new()),
+            pending: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
