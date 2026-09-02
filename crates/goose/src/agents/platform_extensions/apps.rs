@@ -837,6 +837,7 @@ mod tests {
                 scheduler: None,
                 session: None,
                 use_login_shell_path: false,
+                tool_confirmation_router: None,
             },
             apps_dir,
         }
