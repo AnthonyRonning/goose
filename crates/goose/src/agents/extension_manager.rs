@@ -133,6 +133,13 @@ struct Extension {
     client: McpClientBox,
     server_info: Option<ServerInfo>,
     _temp_dir: Option<tempfile::TempDir>,
+    persistence: ExtensionPersistence,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExtensionPersistence {
+    Persisted,
+    Ephemeral,
 }
 
 impl Extension {
@@ -142,6 +149,7 @@ impl Extension {
         client: McpClientBox,
         server_info: Option<ServerInfo>,
         temp_dir: Option<tempfile::TempDir>,
+        persistence: ExtensionPersistence,
     ) -> Self {
         Self {
             client,
@@ -149,6 +157,7 @@ impl Extension {
             resolved_config,
             server_info,
             _temp_dir: temp_dir,
+            persistence,
         }
     }
 
@@ -1058,7 +1067,10 @@ impl ExtensionManager {
         let resolved_config = config.clone().resolve(Config::global()).await?;
 
         if let Some(existing) = self.extensions.lock().await.get(&sanitized_name) {
-            if existing.config == config && existing.resolved_config == resolved_config {
+            if existing.config == config
+                && existing.resolved_config == resolved_config
+                && existing.persistence == ExtensionPersistence::Persisted
+            {
                 return Ok(());
             }
             tracing::debug!(
@@ -1325,6 +1337,7 @@ impl ExtensionManager {
                 Arc::from(client),
                 server_info,
                 temp_dir,
+                ExtensionPersistence::Persisted,
             ),
         );
         drop(extensions);
@@ -1333,6 +1346,7 @@ impl ExtensionManager {
         Ok(())
     }
 
+    /// Add a client whose configuration is returned by [`Self::get_extension_configs`].
     pub async fn add_client(
         &self,
         name: String,
@@ -1341,10 +1355,51 @@ impl ExtensionManager {
         info: Option<ServerInfo>,
         temp_dir: Option<TempDir>,
     ) {
+        self.add_client_with_persistence(
+            name,
+            config,
+            client,
+            info,
+            temp_dir,
+            ExtensionPersistence::Persisted,
+        )
+        .await;
+    }
+
+    /// Add an in-memory client that participates in normal tool discovery and dispatch but is
+    /// omitted from [`Self::get_extension_configs`].
+    pub async fn add_ephemeral_client(
+        &self,
+        name: String,
+        config: ExtensionConfig,
+        client: McpClientBox,
+        info: Option<ServerInfo>,
+        temp_dir: Option<TempDir>,
+    ) {
+        self.add_client_with_persistence(
+            name,
+            config,
+            client,
+            info,
+            temp_dir,
+            ExtensionPersistence::Ephemeral,
+        )
+        .await;
+    }
+
+    async fn add_client_with_persistence(
+        &self,
+        name: String,
+        config: ExtensionConfig,
+        client: McpClientBox,
+        info: Option<ServerInfo>,
+        temp_dir: Option<TempDir>,
+        persistence: ExtensionPersistence,
+    ) {
         let normalized = name_to_key(&name);
         self.extensions.lock().await.insert(
             normalized,
-            Extension::new(config.clone(), config.clone(), client, info, temp_dir),
+            Extension::new(config.clone(), config, client, info, temp_dir, persistence),
         );
         self.invalidate_tools_cache_and_bump_version().await;
     }
@@ -1395,6 +1450,7 @@ impl ExtensionManager {
             .lock()
             .await
             .values()
+            .filter(|ext| ext.persistence == ExtensionPersistence::Persisted)
             .map(|ext| ext.config.clone())
             .collect()
     }
@@ -2461,7 +2517,14 @@ mod tests {
                 bundled: None,
                 available_tools,
             };
-            let extension = Extension::new(config.clone(), config.clone(), client, None, None);
+            let extension = Extension::new(
+                config.clone(),
+                config,
+                client,
+                None,
+                None,
+                ExtensionPersistence::Persisted,
+            );
             self.extensions
                 .lock()
                 .await
@@ -2579,6 +2642,79 @@ mod tests {
         async fn subscribe(&self) -> mpsc::Receiver<ServerNotification> {
             mpsc::channel(1).1
         }
+    }
+
+    fn mock_client_config(name: &str) -> ExtensionConfig {
+        ExtensionConfig::Builtin {
+            name: name.to_string(),
+            display_name: Some(name.to_string()),
+            description: "built-in".to_string(),
+            timeout: None,
+            bundled: None,
+            available_tools: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn ephemeral_client_is_active_but_not_persisted() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let extension_manager =
+            ExtensionManager::new_without_provider(temp_dir.path().to_path_buf());
+        let persisted_config = mock_client_config("persisted");
+        let ephemeral_config = mock_client_config("ephemeral");
+
+        extension_manager
+            .add_client(
+                "persisted".to_string(),
+                persisted_config.clone(),
+                Arc::new(MockClient {}),
+                None,
+                None,
+            )
+            .await;
+        extension_manager
+            .add_ephemeral_client(
+                "ephemeral".to_string(),
+                ephemeral_config,
+                Arc::new(MockClient {}),
+                None,
+                None,
+            )
+            .await;
+
+        let tools = extension_manager
+            .get_prefixed_tools("session", None)
+            .await
+            .unwrap();
+        assert!(tools.iter().any(|tool| tool.name == "ephemeral__tool"));
+
+        let context = ToolCallContext::new("session".to_string(), None, None);
+        let dispatched = extension_manager
+            .dispatch_tool_call(
+                &context,
+                CallToolRequestParams::new("ephemeral__tool".to_string()),
+                CancellationToken::default(),
+            )
+            .await
+            .unwrap();
+        assert!(dispatched.result.await.is_ok());
+
+        assert_eq!(
+            extension_manager.get_extension_configs().await,
+            vec![persisted_config]
+        );
+
+        extension_manager
+            .remove_extension("ephemeral")
+            .await
+            .unwrap();
+        assert!(!extension_manager.is_extension_enabled("ephemeral").await);
+        assert!(extension_manager
+            .get_prefixed_tools("session", None)
+            .await
+            .unwrap()
+            .iter()
+            .all(|tool| tool.name != "ephemeral__tool"));
     }
 
     struct ContextNotificationClient;
