@@ -11,11 +11,12 @@ use crate::agents::extension_manager::ExtensionManager;
 use crate::agents::platform_extensions::MANAGE_EXTENSIONS_TOOL_NAME_COMPLETE;
 use crate::agents::state_machine::ops_tool_approval::request_executable;
 use crate::agents::state_machine::{
-    applied, messages_since_kickoff, not_applicable, yielded_with, ConversationEffect, Emitter,
-    GooseEffect, Operation, OperationResult, SlashCommand,
+    applied, messages_since_kickoff, not_applicable, yielded, yielded_with, ConversationEffect,
+    Emitter, GooseEffect, Operation, OperationResult, SlashCommand,
 };
 use crate::agents::tool_execution::{
-    tool_stream, ToolCallResult, ToolStreamItem, CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE,
+    schedule_tool_streams, tool_stream, OrderedToolCalls, ToolCallResult, ToolStreamItem,
+    CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE,
 };
 use crate::agents::AgentEvent;
 use crate::config::GooseMode;
@@ -84,6 +85,7 @@ pub struct ToolExecutionOperation<'a> {
     goose_mode: &'a Mutex<GooseMode>,
     extension_manager: Arc<ExtensionManager>,
     hook_manager: HookManager,
+    ordered_tool_calls: Option<&'a OrderedToolCalls>,
 }
 
 impl<'a> ToolExecutionOperation<'a> {
@@ -91,11 +93,13 @@ impl<'a> ToolExecutionOperation<'a> {
         goose_mode: &'a Mutex<GooseMode>,
         extension_manager: Arc<ExtensionManager>,
         hook_manager: HookManager,
+        ordered_tool_calls: Option<&'a OrderedToolCalls>,
     ) -> Self {
         Self {
             goose_mode,
             extension_manager,
             hook_manager,
+            ordered_tool_calls,
         }
     }
 
@@ -574,6 +578,51 @@ fn approval_denied(permission: Option<&crate::permission::Permission>) -> bool {
     )
 }
 
+fn ordered_group_awaits_approval(
+    messages: &[Message],
+    known_tools: &HashSet<String>,
+    policy: &OrderedToolCalls,
+) -> bool {
+    let mut requested = HashSet::new();
+    let mut resolved = HashSet::new();
+    for message in messages {
+        for content in &message.content {
+            match content {
+                MessageContent::ToolResponse(response) => {
+                    resolved.insert(response.id.as_str());
+                }
+                MessageContent::ActionRequired(action) => match &action.data {
+                    ActionRequiredData::ToolConfirmation { id, .. } => {
+                        requested.insert(id.as_str());
+                    }
+                    ActionRequiredData::ToolConfirmationResponse { id, .. } => {
+                        resolved.insert(id.as_str());
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
+
+    messages
+        .iter()
+        .filter(|message| message.role == Role::Assistant)
+        .flat_map(|message| &message.content)
+        .any(|content| match content {
+            MessageContent::ToolRequest(request) => {
+                requested.contains(request.id.as_str())
+                    && !resolved.contains(request.id.as_str())
+                    && request_executable(request) == Some(false)
+                    && request.tool_call.as_ref().is_ok_and(|call| {
+                        known_tools.contains(call.name.as_ref())
+                            && policy.contains(call.name.as_ref())
+                    })
+            }
+            _ => false,
+        })
+}
+
 #[async_trait]
 impl Operation<Session, GooseEffect> for ToolExecutionOperation<'_> {
     fn name(&self) -> &'static str {
@@ -679,8 +728,9 @@ impl Operation<Session, GooseEffect> for ToolExecutionOperation<'_> {
         conversation: &Conversation,
         emit: &Emitter,
     ) -> Result<OperationResult<GooseEffect>> {
-        let mut pending = pending_tool_requests(messages_since_kickoff(conversation)?);
-        if pending.is_empty() {
+        let messages = messages_since_kickoff(conversation)?;
+        let mut pending = pending_tool_requests(messages);
+        if pending.is_empty() && self.ordered_tool_calls.is_none() {
             return not_applicable();
         }
 
@@ -698,12 +748,36 @@ impl Operation<Session, GooseEffect> for ToolExecutionOperation<'_> {
                 .as_ref()
                 .is_ok_and(|tool_call| known_tools.contains(tool_call.name.as_ref()))
         });
+        let goose_mode = *self.goose_mode.lock().await;
+        let awaiting_ordered_approval = goose_mode != GooseMode::Chat
+            && self.ordered_tool_calls.is_some_and(|policy| {
+                ordered_group_awaits_approval(messages, &known_tools, policy)
+            });
+        if let Some(policy) = self
+            .ordered_tool_calls
+            .filter(|_| awaiting_ordered_approval)
+        {
+            // Approvals may arrive over separate state-machine invocations.
+            // Admit the group together so an approved tail cannot overtake an
+            // earlier call or acquire a fresh batch budget on each resume.
+            pending.retain(|(request, disposition)| {
+                *disposition != ToolDisposition::Execute
+                    || !request
+                        .tool_call
+                        .as_ref()
+                        .is_ok_and(|call| policy.contains(call.name.as_ref()))
+            });
+        }
         let requests: Vec<_> = pending.iter().map(|(request, _)| request.clone()).collect();
         if requests.is_empty() {
-            return not_applicable();
+            return if awaiting_ordered_approval {
+                yielded()
+            } else {
+                not_applicable()
+            };
         }
 
-        if *self.goose_mode.lock().await == GooseMode::Chat {
+        if goose_mode == GooseMode::Chat {
             let mut response = Message::user();
             for (request, disposition) in &pending {
                 let result = match disposition {
@@ -756,7 +830,6 @@ impl Operation<Session, GooseEffect> for ToolExecutionOperation<'_> {
                 .await;
             let result = result.unwrap_or_else(|error_data| ToolCallResult::from(Err(error_data)));
 
-            let req_id = request.id.clone();
             let stream = tool_stream(
                 result
                     .notification_stream
@@ -765,12 +838,16 @@ impl Operation<Session, GooseEffect> for ToolExecutionOperation<'_> {
                     .action_required_stream
                     .unwrap_or_else(|| Box::new(futures::stream::empty())),
                 result.result,
-            )
-            .map(move |item| (req_id.clone(), item));
-            tool_streams.push(stream);
+            );
+            tool_streams.push((request.id.clone(), stream));
         }
 
-        let mut combined = futures::stream::select_all(tool_streams);
+        let mut combined = schedule_tool_streams(
+            tool_streams,
+            &requests,
+            self.ordered_tool_calls,
+            emit.cancel_token().clone(),
+        );
         let mut response = Message::user();
         let mut effects = Vec::new();
         for (request, disposition) in &pending {
@@ -862,13 +939,102 @@ impl Operation<Session, GooseEffect> for ToolExecutionOperation<'_> {
 
         let response = emit.message(response).await;
         effects.push(response.into());
-        applied(effects)
+        if awaiting_ordered_approval {
+            // Deferred requests must remain unanswered until the client
+            // resumes; later operations would otherwise report them as unknown
+            // tools or start another inference with an incomplete batch.
+            yielded_with(effects)
+        } else {
+            applied(effects)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroUsize;
+
+    fn ordered_policy() -> OrderedToolCalls {
+        OrderedToolCalls::new(
+            ["python".to_string(), "developer__python".to_string()],
+            NonZeroUsize::new(2).unwrap(),
+        )
+    }
+
+    fn approval_messages(name: &str) -> Vec<Message> {
+        let mut request = Message::assistant()
+            .with_tool_request("first", Ok(CallToolRequestParams::new(name.to_string())));
+        let MessageContent::ToolRequest(call) = &mut request.content[0] else {
+            unreachable!();
+        };
+        call.tool_meta = Some(serde_json::json!({ "goose.executable": false }));
+        vec![
+            request,
+            Message::assistant()
+                .with_action_required("first", name.to_string(), Default::default(), None)
+                .user_only(),
+        ]
+    }
+
+    #[test]
+    fn ordered_approval_wait_ends_after_allow_or_denial() {
+        let known = HashSet::from(["python".to_string()]);
+        let policy = ordered_policy();
+        let messages = approval_messages("python");
+        assert!(ordered_group_awaits_approval(&messages, &known, &policy));
+        for permission in [
+            crate::permission::Permission::AllowOnce,
+            crate::permission::Permission::AlwaysAllow,
+            crate::permission::Permission::DenyOnce,
+            crate::permission::Permission::AlwaysDeny,
+            crate::permission::Permission::Cancel,
+        ] {
+            let mut resolved = messages.clone();
+            resolved.push(Message::user().with_content(
+                MessageContent::action_required_tool_confirmation_response("first", permission),
+            ));
+            assert!(!ordered_group_awaits_approval(&resolved, &known, &policy));
+        }
+    }
+
+    #[test]
+    fn ordered_approval_wait_ignores_inspection_denial_and_settled_calls() {
+        let known = HashSet::from(["python".to_string()]);
+        let policy = ordered_policy();
+        let mut messages = approval_messages("python");
+        assert!(!ordered_group_awaits_approval(
+            &messages[..1],
+            &known,
+            &policy,
+        ));
+        messages.push(Message::user().with_tool_response(
+            "first",
+            Ok(CallToolResult::error(vec![ContentBlock::text("denied")])),
+        ));
+        assert!(!ordered_group_awaits_approval(&messages, &known, &policy));
+    }
+
+    #[test]
+    fn ordered_approval_wait_requires_a_known_configured_tool() {
+        let policy = ordered_policy();
+        let known = HashSet::from(["python".to_string(), "read".to_string()]);
+        assert!(!ordered_group_awaits_approval(
+            &approval_messages("read"),
+            &known,
+            &policy,
+        ));
+        assert!(!ordered_group_awaits_approval(
+            &approval_messages("developer__python"),
+            &known,
+            &policy,
+        ));
+        assert!(!ordered_group_awaits_approval(
+            &approval_messages("unknown"),
+            &known,
+            &policy,
+        ));
+    }
 
     #[test]
     fn reads_platform_notification_from_tool_result() {

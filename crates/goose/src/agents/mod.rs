@@ -35,7 +35,7 @@ pub use prompt_manager::PromptManager;
 pub use schedule_tool::ScheduleTool;
 pub use subagent_handler::SUBAGENT_TOOL_REQUEST_TYPE;
 pub use subagent_task_config::TaskConfig;
-pub use tool_execution::ToolCallContext;
+pub use tool_execution::{OrderedToolCalls, ToolCallContext};
 pub use types::{FrontendTool, RetryConfig, SessionConfig, SuccessCheck};
 
 fn latest_provider_session_id<'a>(
