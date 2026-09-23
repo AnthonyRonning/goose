@@ -790,6 +790,16 @@ fn deserialize_session_model_config(
     json: &str,
 ) -> Option<ModelConfig> {
     let mut model_config: ModelConfig = serde_json::from_str(json).ok()?;
+    // Maple owns a catalog context limit per session. Keep its stored value
+    // while the generic ModelConfig decoder ignores legacy provider overrides.
+    if provider_name == Some("maple") {
+        model_config.context_limit = serde_json::from_str::<serde_json::Value>(json)
+            .ok()?
+            .get("context_limit")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|limit| usize::try_from(limit).ok())
+            .filter(|limit| *limit > 0);
+    }
     // TODO: Remove this workaround once ModelConfig guarantees deserialize(serialize(config)) == config.
     if provider_name == Some(goose_providers::azure_foundry::AZURE_FOUNDRY_PROVIDER_NAME) {
         #[derive(Deserialize)]
@@ -804,6 +814,16 @@ fn deserialize_session_model_config(
         model_config.request_params = persisted.request_params;
     }
     Some(model_config)
+}
+
+fn serialize_session_model_config(model_config: &ModelConfig) -> Result<String> {
+    let mut value = serde_json::to_value(model_config)?;
+    // The provider name is stored separately in the session row. The generic
+    // decoder discards this field; only Maple restores it above.
+    if let Some(limit) = model_config.context_limit {
+        value["context_limit"] = serde_json::json!(limit);
+    }
+    Ok(serde_json::to_string(&value)?)
 }
 
 impl sqlx::FromRow<'_, sqlx::sqlite::SqliteRow> for Session {
@@ -1200,7 +1220,7 @@ impl SessionStorage {
         };
 
         let model_config_json = match &session.model_config {
-            Some(model_config) => Some(serde_json::to_string(model_config)?),
+            Some(model_config) => Some(serialize_session_model_config(model_config)?),
             None => None,
         };
 
@@ -1819,7 +1839,7 @@ impl SessionStorage {
         }
         if let Some(model_config) = builder.model_config {
             let model_config_json = model_config
-                .map(|mc| serde_json::to_string(&mc))
+                .map(|mc| serialize_session_model_config(&mc))
                 .transpose()?;
             q = q.bind(model_config_json);
         }
@@ -2948,6 +2968,20 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.context_limit, None);
+    }
+
+    #[test]
+    fn maple_session_context_limit_survives_storage_round_trip() {
+        let config = ModelConfig::new("glm-5-2").with_context_limit(Some(384_000));
+        let json = serialize_session_model_config(&config).unwrap();
+        let restored = deserialize_session_model_config(Some("maple"), &json).unwrap();
+        assert_eq!(restored.context_limit, Some(384_000));
+        assert_eq!(
+            deserialize_session_model_config(Some("openai"), &json)
+                .unwrap()
+                .context_limit,
+            None
+        );
     }
 
     #[test]
