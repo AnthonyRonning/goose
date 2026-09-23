@@ -6,6 +6,8 @@ use tracing::warn;
 
 use crate::permission::PermissionConfirmation;
 
+type PendingConfirmations = HashMap<(String, String), oneshot::Sender<PermissionConfirmation>>;
+
 /// Routes permission confirmations to the awaiting tool request.
 ///
 /// Clones share the same pending map, which lets subagents register their
@@ -13,7 +15,7 @@ use crate::permission::PermissionConfirmation;
 /// parent agent reach the subagent that is waiting for them.
 #[derive(Clone)]
 pub struct ToolConfirmationRouter {
-    pending: Arc<Mutex<HashMap<(String, String), oneshot::Sender<PermissionConfirmation>>>>,
+    pending: Arc<Mutex<PendingConfirmations>>,
 }
 
 impl Default for ToolConfirmationRouter {
@@ -90,6 +92,27 @@ mod tests {
         );
         let confirmation = rx.await.unwrap();
         assert_eq!(confirmation.permission, Permission::AllowOnce);
+    }
+
+    #[tokio::test]
+    async fn cloned_router_delivers_subagent_confirmation_once() {
+        let parent_router = ToolConfirmationRouter::new();
+        let subagent_router = parent_router.clone();
+        let rx = subagent_router
+            .register("parent".to_string(), "subagent:request".to_string())
+            .await;
+
+        assert!(
+            parent_router
+                .deliver("parent", "subagent:request", test_confirmation())
+                .await
+        );
+        assert_eq!(rx.await.unwrap().permission, Permission::AllowOnce);
+        assert!(
+            !parent_router
+                .deliver("parent", "subagent:request", test_confirmation())
+                .await
+        );
     }
 
     #[tokio::test]

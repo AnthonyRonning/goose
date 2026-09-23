@@ -765,6 +765,7 @@ mod tests {
             scheduler: None,
             session: session.map(Arc::new),
             use_login_shell_path: false,
+            tool_confirmation_router: None,
         })
         .unwrap()
     }

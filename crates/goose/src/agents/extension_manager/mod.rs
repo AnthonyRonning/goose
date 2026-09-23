@@ -625,7 +625,13 @@ impl ExtensionManager {
         client: McpClientBox,
         info: Option<ServerInfo>,
     ) {
-        self.add_client_with_persistence(name, config, client, info, ExtensionPersistence::Persisted)
+        self.add_client_with_persistence(
+            name,
+            config,
+            client,
+            info,
+            ExtensionPersistence::Persisted,
+        )
         .await;
     }
 
@@ -638,7 +644,13 @@ impl ExtensionManager {
         client: McpClientBox,
         info: Option<ServerInfo>,
     ) {
-        self.add_client_with_persistence(name, config, client, info, ExtensionPersistence::Ephemeral)
+        self.add_client_with_persistence(
+            name,
+            config,
+            client,
+            info,
+            ExtensionPersistence::Ephemeral,
+        )
         .await;
     }
 
