@@ -343,6 +343,7 @@ mod tests {
             scheduler: None,
             session: Some(session),
             use_login_shell_path: false,
+            tool_confirmation_router: None,
         })
         .unwrap()
         .with_builtin_skills(false)
