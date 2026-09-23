@@ -445,6 +445,7 @@ mod tests {
             scheduler: None,
             session: Some(Arc::new(current_session.clone())),
             use_login_shell_path: false,
+            tool_confirmation_router: None,
         })
         .unwrap();
         let load_output = client

@@ -718,13 +718,13 @@ impl SummonClient {
         })
     }
 
-    async fn parent_goose_mode(&self, parent_session_id: &str) -> GooseMode {
+    async fn parent_goose_mode(&self, parent_session_id: &str) -> Result<GooseMode, String> {
         self.context
             .session_manager
             .get_session(parent_session_id, false)
             .await
             .map(|session| session.goose_mode)
-            .unwrap_or(GooseMode::Auto)
+            .map_err(|error| format!("Failed to load parent session permission mode: {error}"))
     }
 
     /// The parent agent's confirmation router, when this client belongs to an
@@ -1578,7 +1578,7 @@ impl SummonClient {
         // messages (tool confirmations, elicitations) are forwarded to the
         // delegate tool call's stream, so modes that require approval no
         // longer hang; the parent's client answers them.
-        let parent_mode = self.parent_goose_mode(session_id).await;
+        let parent_mode = self.parent_goose_mode(session_id).await?;
         let tool_confirmation_router = self.parent_tool_confirmation_router();
         let mut agent_config = AgentConfig::new(
             self.context.session_manager.clone(),
@@ -2266,7 +2266,7 @@ impl SummonClient {
         // messages (tool confirmations, elicitations) buffer in the task's
         // action-required sink and surface when `load` attaches to the
         // parent's client.
-        let parent_mode = self.parent_goose_mode(session_id).await;
+        let parent_mode = self.parent_goose_mode(session_id).await?;
         let tool_confirmation_router = self.parent_tool_confirmation_router();
         let mut agent_config = AgentConfig::new(
             self.context.session_manager.clone(),
@@ -2600,6 +2600,59 @@ mod tests {
     }
 
     const TEST_SESSION_ID: &str = "test-session-id";
+
+    #[tokio::test]
+    async fn subagent_inherits_parent_permission_mode_and_requires_a_parent_session() {
+        let temp_dir = TempDir::new().unwrap();
+        let session_manager = Arc::new(crate::session::SessionManager::new(
+            temp_dir.path().join("sessions"),
+        ));
+        let parent = session_manager
+            .create_session(
+                temp_dir.path().to_path_buf(),
+                "Parent".to_string(),
+                SessionType::User,
+                GooseMode::SmartApprove,
+            )
+            .await
+            .unwrap();
+        let client =
+            SummonClient::new(create_test_context_with_session_manager(session_manager)).unwrap();
+
+        assert_eq!(
+            client.parent_goose_mode(&parent.id).await.unwrap(),
+            GooseMode::SmartApprove
+        );
+        assert!(client.parent_goose_mode("missing").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn buffered_subagent_approval_reaches_parent_tool_call() {
+        let manager = Arc::new(crate::action_required_manager::ActionRequiredManager::new());
+        let sink = ActionRequiredSink::new(Arc::clone(&manager));
+        sink.send(Message::assistant().with_action_required(
+            "subagent:request",
+            "developer__shell".to_string(),
+            serde_json::Map::new(),
+            None,
+        ));
+        let mut stream = manager
+            .register_action_required_stream("parent".to_string(), "delegate".to_string())
+            .await;
+
+        sink.attach("parent".to_string(), "delegate".to_string());
+        let forwarded = tokio::time::timeout(Duration::from_secs(1), stream.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            &forwarded.content[0],
+            MessageContent::ActionRequired(action) if matches!(
+                &action.data,
+                ActionRequiredData::ToolConfirmation { id, .. } if id == "subagent:request"
+            )
+        ));
+    }
 
     #[test]
     fn test_agent_frontmatter_parsing() {
@@ -4130,8 +4183,10 @@ You review code."#;
             ],
         )
         .await;
-        let client =
-            SummonClient::new(create_test_context_with_session_manager(session_manager)).unwrap();
+        let client = SummonClient::new(create_test_context_with_session_manager(Arc::clone(
+            &session_manager,
+        )))
+        .unwrap();
 
         let handle = tokio::spawn(async { Ok("Inspection complete".to_string()) });
         while !handle.is_finished() {
@@ -4150,6 +4205,7 @@ You review code."#;
                 cancellation_token: CancellationToken::new(),
                 completion_token: CancellationToken::new(),
                 notification_sink: buffered_notification_sink(Vec::new()),
+                action_required_sink: ActionRequiredSink::new(session_manager.action_required()),
             },
         );
 
@@ -4158,7 +4214,7 @@ You review code."#;
             .unwrap()
             .clone();
         let result = client
-            .handle_load("parent", Some(arguments), None)
+            .handle_load("parent", Some(arguments), None, None)
             .await
             .unwrap();
         let text = extract_text(&result.content[0]);
@@ -4503,6 +4559,7 @@ You review code."#;
                 cancellation_token: CancellationToken::new(),
                 completion_token,
                 notification_sink: buffered_notification_sink(Vec::new()),
+                action_required_sink: ActionRequiredSink::new(session_manager.action_required()),
             },
         );
 
@@ -4513,7 +4570,8 @@ You review code."#;
         }
         tokio::task::yield_now().await;
 
-        let mut load = Box::pin(client.handle_load_task_result(&task_id, false, false, None));
+        let mut load =
+            Box::pin(client.handle_load_task_result("parent", &task_id, false, false, None, None));
         let first_poll = std::future::poll_fn(|cx| {
             std::task::Poll::Ready(std::future::Future::poll(load.as_mut(), cx))
         })
@@ -4529,7 +4587,7 @@ You review code."#;
 
         drop(held_connections);
         let result = client
-            .handle_load_task_result(&task_id, false, false, None)
+            .handle_load_task_result("parent", &task_id, false, false, None, None)
             .await
             .unwrap();
         assert_eq!(result.status, "completed");
@@ -4583,7 +4641,7 @@ You review code."#;
         }
 
         let result = client
-            .handle_load_task_result(&task_id, false, true, None)
+            .handle_load_task_result("parent", &task_id, false, true, None, None)
             .await
             .unwrap();
         assert!(extract_text(&result.content[0]).contains("Task is initialising"));
@@ -4591,7 +4649,7 @@ You review code."#;
         // Activity can arrive before the assistant block is durably persisted.
         last_activity.store(current_epoch_millis(), Ordering::Relaxed);
         let result = client
-            .handle_load_task_result(&task_id, false, true, None)
+            .handle_load_task_result("parent", &task_id, false, true, None, None)
             .await
             .unwrap();
         let text = extract_text(&result.content[0]);
