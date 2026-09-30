@@ -1928,8 +1928,16 @@ pub(crate) fn openai_reasoning_efforts_for_model(model_name: &str) -> &'static [
         if normalized.contains("-pro") || normalized.contains("/pro") {
             &["high"]
         } else if normalized.contains("gpt-6") {
-            // GPT-6 Astra does not accept `none`; Sol and Luna do.
-            if normalized.contains("astra") {
+            // GPT-6 Astra and GPT-6.1 Sol require reasoning; GPT-6 Sol and Luna may disable it.
+            let is_gpt_6_1_sol = normalized
+                .match_indices("gpt-6.1-sol")
+                .any(|(index, name)| {
+                    let (prefix, rest) = normalized.split_at(index);
+                    let (_, suffix) = rest.split_at(name.len());
+                    (prefix.is_empty() || prefix.ends_with(['/', '.', '-']))
+                        && (suffix.is_empty() || suffix.starts_with(['-', '@']))
+                });
+            if normalized.contains("astra") || is_gpt_6_1_sol {
                 &["low", "medium", "high", "xhigh", "max"]
             } else {
                 &["none", "low", "medium", "high", "xhigh", "max"]
@@ -3431,6 +3439,13 @@ mod tests {
             "gpt-6-astra",
             "data_workflow_tools.goose.goose-gpt-6-astra",
             "openrouter/openai/gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-6.1-sol-high",
+            "data_workflow_tools.goose.goose-gpt-6.1-sol",
+            "openrouter/openai/gpt-6.1-sol",
+            "gpt-6.1-sol@eu",
+            "openai/gpt-6.1-sol-fast",
+            "openai/gpt-6.1-sol-fast-high",
         ] {
             assert_eq!(
                 openai_reasoning_effort_for_thinking(model, ThinkingEffort::Off),
