@@ -1590,8 +1590,8 @@ impl Agent {
 
         if self
             .tool_confirmation_router
-            .deliver(session_id, request_id, confirmation)
-            .await
+            .deliver_with_ack(session_id, request_id, confirmation)
+            .await?
         {
             if state.contains_request(request_id) {
                 state.record_answer(request_id, ConfirmationAnswer::LiveHandled)?;
@@ -1953,6 +1953,18 @@ impl Agent {
         let AgentEvent::Message(message) = event else {
             return Vec::new();
         };
+
+        // Summon forwards child-owned approval requests through this stream.
+        // The child turn coordinates their answers; registering them here would
+        // leave the parent waiting if the child is cancelled.
+        if message
+            .metadata
+            .operation_note("summon", "forwarded_action_required")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            return Vec::new();
+        }
 
         message
             .content
@@ -4592,6 +4604,28 @@ mod tests {
 
         let conf = rx.await.unwrap();
         assert_eq!(conf.permission, crate::permission::Permission::AllowOnce);
+    }
+
+    #[test]
+    fn forwarded_summon_confirmation_is_owned_by_child_turn() {
+        let own_request = Message::assistant().with_action_required(
+            "tool-request",
+            "developer__shell".to_string(),
+            Default::default(),
+            None,
+        );
+        assert_eq!(
+            Agent::tool_confirmation_request_ids(&AgentEvent::Message(own_request.clone())),
+            vec!["tool-request".to_string()]
+        );
+
+        let mut forwarded = own_request;
+        forwarded.metadata.set_operation_note(
+            "summon",
+            "forwarded_action_required",
+            serde_json::Value::Bool(true),
+        );
+        assert!(Agent::tool_confirmation_request_ids(&AgentEvent::Message(forwarded)).is_empty());
     }
 
     enum EffortOutcome {

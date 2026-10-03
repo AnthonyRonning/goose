@@ -752,8 +752,13 @@ impl SummonClient {
             let manager = manager.clone();
             let sink = sink.clone();
             let parent_session_id = parent_session_id.clone();
-            let message = message.clone();
+            let mut message = message.clone();
             Box::pin(async move {
+                message.metadata.set_operation_note(
+                    "summon",
+                    "forwarded_action_required",
+                    serde_json::Value::Bool(true),
+                );
                 for content in &message.content {
                     if let MessageContent::ActionRequired(action) = content {
                         if let ActionRequiredData::Elicitation { id, .. } = &action.data {

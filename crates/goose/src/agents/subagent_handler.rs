@@ -1,7 +1,7 @@
 use crate::{
     agents::{subagent_task_config::TaskConfig, Agent, AgentConfig, AgentEvent, SessionConfig},
     conversation::{
-        message::{Message, MessageContent},
+        message::{ActionRequiredData, Message, MessageContent},
         Conversation,
     },
     prompt_template::render_template,
@@ -125,6 +125,50 @@ fn extract_response_text(messages: &Conversation, return_last_only: bool) -> Str
 
 pub const SUBAGENT_TOOL_REQUEST_TYPE: &str = "subagent_tool_request";
 
+/// Give the parent's UI an opaque request ID while keeping the child's raw
+/// request ID in its own persisted conversation. The shared router relays the
+/// decision to the child and waits for the child's persistence to succeed.
+pub(crate) async fn prepare_state_machine_subagent_action_required(
+    agent: &Arc<Agent>,
+    child_session_id: &str,
+    message: &Message,
+    cancel: &CancellationToken,
+) -> Result<Message> {
+    let mut forwarded = message.clone();
+    for content in &mut forwarded.content {
+        let MessageContent::ActionRequired(action) = content else {
+            continue;
+        };
+        let ActionRequiredData::ToolConfirmation { id, .. } = &mut action.data else {
+            continue;
+        };
+        let parent_session_id = agent
+            .config
+            .confirmation_session_id
+            .as_ref()
+            .ok_or_else(|| anyhow!("subagent approval has no parent confirmation session"))?;
+        if agent.config.tool_confirmation_router.is_none() {
+            return Err(anyhow!(
+                "subagent approval has no shared confirmation router"
+            ));
+        }
+        let display_id = format!("summon:{}", uuid::Uuid::new_v4());
+        agent
+            .tool_confirmation_router
+            .register_state_machine_subagent(
+                parent_session_id.clone(),
+                display_id.clone(),
+                Arc::downgrade(agent),
+                child_session_id.to_string(),
+                id.clone(),
+                cancel.clone(),
+            )
+            .await?;
+        *id = display_id;
+    }
+    Ok(forwarded)
+}
+
 fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
     Box::pin(async move {
         let SubagentRunParams {
@@ -202,14 +246,16 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             retry_config: recipe.retry,
         };
 
+        let use_state_machine = crate::agents::state_machine::enabled();
+        let cancel = cancellation_token.unwrap_or_default();
         let mut stream =
             crate::session_context::with_session_id(Some(session_id.to_string()), async {
                 agent
                     .reply(
                         user_message,
                         session_config,
-                        crate::agents::state_machine::enabled(),
-                        cancellation_token,
+                        use_state_machine,
+                        Some(cancel.clone()),
                     )
                     .await
             })
@@ -228,7 +274,18 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
                             .iter()
                             .any(|c| matches!(c, MessageContent::ActionRequired(_)))
                         {
-                            forwarder(&msg).await;
+                            let forwarded = if use_state_machine {
+                                prepare_state_machine_subagent_action_required(
+                                    &agent,
+                                    &session_id,
+                                    &msg,
+                                    &cancel,
+                                )
+                                .await?
+                            } else {
+                                msg.clone()
+                            };
+                            forwarder(&forwarded).await;
                         }
                     }
                     if let Some(ref tx) = notification_tx {

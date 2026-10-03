@@ -1,12 +1,36 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
+use anyhow::{anyhow, Result};
 use tokio::sync::{oneshot, Mutex};
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+use crate::agents::Agent;
 use crate::permission::PermissionConfirmation;
 
-type PendingConfirmations = HashMap<(String, String), oneshot::Sender<PermissionConfirmation>>;
+enum PendingConfirmation {
+    Direct(oneshot::Sender<PermissionConfirmation>),
+    StateMachineSubagent {
+        agent: Weak<Agent>,
+        session_id: String,
+        request_id: String,
+        cancel: CancellationToken,
+    },
+}
+
+impl PendingConfirmation {
+    fn is_active(&self) -> bool {
+        match self {
+            Self::Direct(sender) => !sender.is_closed(),
+            Self::StateMachineSubagent { agent, cancel, .. } => {
+                !cancel.is_cancelled() && agent.strong_count() > 0
+            }
+        }
+    }
+}
+
+type PendingConfirmations = HashMap<(String, String), PendingConfirmation>;
 
 /// Routes permission confirmations to the awaiting tool request.
 ///
@@ -38,9 +62,36 @@ impl ToolConfirmationRouter {
     ) -> oneshot::Receiver<PermissionConfirmation> {
         let (tx, rx) = oneshot::channel();
         let mut pending = self.pending.lock().await;
-        pending.retain(|_, sender| !sender.is_closed());
-        pending.insert((session_id, request_id), tx);
+        pending.retain(|_, route| route.is_active());
+        pending.insert((session_id, request_id), PendingConfirmation::Direct(tx));
         rx
+    }
+
+    pub(super) async fn register_state_machine_subagent(
+        &self,
+        parent_session_id: String,
+        display_request_id: String,
+        agent: Weak<Agent>,
+        child_session_id: String,
+        child_request_id: String,
+        cancel: CancellationToken,
+    ) -> Result<()> {
+        let mut pending = self.pending.lock().await;
+        pending.retain(|_, route| route.is_active());
+        let key = (parent_session_id, display_request_id);
+        if pending.contains_key(&key) {
+            return Err(anyhow!("duplicate subagent confirmation route"));
+        }
+        pending.insert(
+            key,
+            PendingConfirmation::StateMachineSubagent {
+                agent,
+                session_id: child_session_id,
+                request_id: child_request_id,
+                cancel,
+            },
+        );
+        Ok(())
     }
 
     pub(super) async fn deliver(
@@ -49,19 +100,61 @@ impl ToolConfirmationRouter {
         request_id: &str,
         confirmation: PermissionConfirmation,
     ) -> bool {
-        let key = (session_id.to_string(), request_id.to_string());
-        if let Some(tx) = self.pending.lock().await.remove(&key) {
-            if tx.send(confirmation).is_err() {
-                warn!(
-                    request_id = %request_id,
-                    "Confirmation receiver was dropped (task cancelled)"
-                );
+        match self
+            .deliver_with_ack(session_id, request_id, confirmation)
+            .await
+        {
+            Ok(delivered) => delivered,
+            Err(error) => {
+                warn!(request_id = %request_id, "Confirmation delivery failed: {error}");
                 false
-            } else {
-                true
             }
-        } else {
-            false
+        }
+    }
+
+    /// A relayed state-machine decision is acknowledged only after the child
+    /// agent has persisted it to its own session.
+    pub(super) async fn deliver_with_ack(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        confirmation: PermissionConfirmation,
+    ) -> Result<bool> {
+        let key = (session_id.to_string(), request_id.to_string());
+        let route = self.pending.lock().await.remove(&key);
+        match route {
+            Some(PendingConfirmation::Direct(tx)) => {
+                if tx.send(confirmation).is_err() {
+                    warn!(
+                        request_id = %request_id,
+                        "Confirmation receiver was dropped (task cancelled)"
+                    );
+                    Ok(false)
+                } else {
+                    Ok(true)
+                }
+            }
+            Some(PendingConfirmation::StateMachineSubagent {
+                agent,
+                session_id,
+                request_id,
+                cancel,
+            }) => {
+                if cancel.is_cancelled() {
+                    return Err(anyhow!("subagent confirmation request was cancelled"));
+                }
+                let agent = agent
+                    .upgrade()
+                    .ok_or_else(|| anyhow!("subagent confirmation request is no longer active"))?;
+                Box::pin(agent.submit_tool_confirmation(
+                    &session_id,
+                    &request_id,
+                    confirmation.permission,
+                ))
+                .await?;
+                Ok(true)
+            }
+            None => Ok(false),
         }
     }
 }

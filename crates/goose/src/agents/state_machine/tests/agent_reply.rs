@@ -18,11 +18,14 @@ use super::dummy_api::{DummyApi, ProviderFeatures};
 use crate::acp::server::GooseAcpAgent;
 use crate::agents::extension::ExtensionConfig;
 use crate::agents::mcp_client::McpClientTrait;
+use crate::agents::subagent_handler::prepare_state_machine_subagent_action_required;
+use crate::agents::tool_execution::DECLINED_RESPONSE;
 use crate::agents::{Agent, AgentConfig, AgentEvent, GoosePlatform, SessionConfig};
 use crate::config::permission::PermissionManager;
 use crate::config::GooseMode;
 use crate::conversation::message::{ActionRequiredData, Message, MessageContent};
-use crate::permission::Permission;
+use crate::permission::permission_confirmation::PrincipalType;
+use crate::permission::{Permission, PermissionConfirmation};
 use crate::providers::base::Provider;
 use crate::session::{SessionManager, SessionType};
 use goose_providers::model::ModelConfig;
@@ -289,6 +292,473 @@ async fn state_machine_confirmation_through_agent_resumes_tool_call() -> Result<
         1
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn probe_legacy_confirmation_does_not_resume_state_machine() -> Result<()> {
+    let _guard = env_lock::lock_env([("GOOSE_STATE_MACHINE", Some("1"))]);
+    let (agent, api, session_id, calculator, _temp_dir) = agent_with_calculator().await?;
+    let agent = Arc::new(agent);
+
+    api.on("add one").call(ADD, value(1));
+    api.on("result: 1").reply("the result is one");
+    let mut stream = agent
+        .reply(
+            Message::user().with_text("add one"),
+            SessionConfig {
+                id: session_id.clone(),
+                schedule_id: None,
+                max_turns: Some(2),
+                retry_config: None,
+            },
+            true,
+            Some(CancellationToken::new()),
+        )
+        .await?;
+    let confirmation_id = loop {
+        let event = stream.next().await.expect("approval event")?;
+        if let AgentEvent::Message(message) = event {
+            if let Some(id) = confirmation_ids(&[message]).pop() {
+                break id;
+            }
+        }
+    };
+
+    agent
+        .handle_confirmation(
+            &session_id,
+            confirmation_id.clone(),
+            PermissionConfirmation {
+                principal_type: PrincipalType::Tool,
+                permission: Permission::AllowOnce,
+            },
+        )
+        .await;
+
+    let session = agent
+        .config
+        .session_manager
+        .get_session(&session_id, true)
+        .await?;
+    assert!(session.conversation.as_ref().expect("conversation").messages().iter().all(|message| {
+        message.content.iter().all(|content| !matches!(content, MessageContent::ActionRequired(action)
+            if matches!(&action.data, ActionRequiredData::ToolConfirmationResponse { id, .. } if id == &confirmation_id)))
+    }));
+    assert_eq!(calculator.total(), 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), stream_messages(stream))
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn probe_forwarded_child_approval_is_unknown_to_parent() -> Result<()> {
+    let _guard = env_lock::lock_env([("GOOSE_STATE_MACHINE", Some("1"))]);
+    let (mut child, api, child_session_id, calculator, _temp_dir) = agent_with_calculator().await?;
+    let sessions = child.config.session_manager.clone();
+    let parent_session = sessions
+        .create_session(
+            std::env::temp_dir(),
+            "parent".to_string(),
+            SessionType::User,
+            GooseMode::Approve,
+        )
+        .await?;
+    child.config.confirmation_session_id = Some(parent_session.id.clone());
+    let parent = Arc::new(Agent::with_config(
+        AgentConfig::new(
+            sessions.clone(),
+            child.config.permission_manager.clone(),
+            None,
+            GooseMode::Approve,
+            true,
+            GoosePlatform::GooseCli,
+        )
+        .with_tool_confirmation_router(Some(child.tool_confirmation_router.clone())),
+    ));
+    let child = Arc::new(child);
+    assert_eq!(
+        sessions
+            .get_session(&child_session_id, false)
+            .await?
+            .goose_mode,
+        sessions
+            .get_session(&parent_session.id, false)
+            .await?
+            .goose_mode
+    );
+
+    api.on("add one").call(ADD, value(1));
+    api.on("result: 1").reply("the result is one");
+    let cancel = CancellationToken::new();
+    let mut child_stream = child
+        .reply(
+            Message::user().with_text("add one"),
+            SessionConfig {
+                id: child_session_id,
+                schedule_id: None,
+                max_turns: Some(2),
+                retry_config: None,
+            },
+            true,
+            Some(cancel.clone()),
+        )
+        .await?;
+    let action_required = loop {
+        let event = child_stream.next().await.expect("child approval event")?;
+        if let AgentEvent::Message(message) = event {
+            if !confirmation_ids(std::slice::from_ref(&message)).is_empty() {
+                break message;
+            }
+        }
+    };
+    let raw_id = confirmation_ids(std::slice::from_ref(&action_required))
+        .pop()
+        .unwrap();
+    let manager = sessions.action_required();
+    let mut parent_approval_stream = manager
+        .register_action_required_stream(parent_session.id.clone(), "delegate".to_string())
+        .await;
+    manager.forward_action_required(&parent_session.id, "delegate", action_required)?;
+    let forwarded = tokio::time::timeout(Duration::from_secs(1), parent_approval_stream.recv())
+        .await?
+        .expect("forwarded approval");
+    assert_eq!(confirmation_ids(&[forwarded]), vec![raw_id.clone()]);
+
+    assert!(parent
+        .submit_tool_confirmation(&parent_session.id, &raw_id, Permission::AllowOnce)
+        .await
+        .is_err());
+    assert_eq!(calculator.total(), 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), stream_messages(child_stream))
+            .await
+            .is_err()
+    );
+    cancel.cancel();
+    Ok(())
+}
+
+async fn relay_fixture() -> Result<(
+    Arc<Agent>,
+    Arc<Agent>,
+    Arc<DummyApi>,
+    String,
+    String,
+    Arc<CalculatorExtension>,
+    tempfile::TempDir,
+)> {
+    let (mut child, api, child_session_id, calculator, temp_dir) = agent_with_calculator().await?;
+    let sessions = child.config.session_manager.clone();
+    let parent_session = sessions
+        .create_session(
+            temp_dir.path().to_path_buf(),
+            "parent".to_string(),
+            SessionType::User,
+            GooseMode::Approve,
+        )
+        .await?;
+    child.config.confirmation_session_id = Some(parent_session.id.clone());
+    child.config.tool_confirmation_router = Some(child.tool_confirmation_router.clone());
+    let parent = Arc::new(Agent::with_config(
+        AgentConfig::new(
+            sessions,
+            child.config.permission_manager.clone(),
+            None,
+            GooseMode::Approve,
+            true,
+            GoosePlatform::GooseCli,
+        )
+        .with_tool_confirmation_router(Some(child.tool_confirmation_router.clone())),
+    ));
+    Ok((
+        parent,
+        Arc::new(child),
+        api,
+        parent_session.id,
+        child_session_id,
+        calculator,
+        temp_dir,
+    ))
+}
+
+async fn first_confirmation(
+    stream: &mut futures::stream::BoxStream<'_, Result<AgentEvent>>,
+) -> Result<Message> {
+    loop {
+        let event = stream.next().await.expect("child approval event")?;
+        if let AgentEvent::Message(message) = event {
+            if !confirmation_ids(std::slice::from_ref(&message)).is_empty() {
+                return Ok(message);
+            }
+        }
+    }
+}
+
+async fn relay_approval_case(permission: Permission, expected_total: i64) -> Result<()> {
+    let _guard = env_lock::lock_env([("GOOSE_STATE_MACHINE", Some("1"))]);
+    let (parent, child, api, parent_session_id, child_session_id, calculator, _temp_dir) =
+        relay_fixture().await?;
+    api.on("add one")
+        .calls([("raw-child-request", ADD, value(1))]);
+    api.on("result: 1").reply("the result is one");
+    api.on(DECLINED_RESPONSE).reply("the tool was denied");
+
+    let cancel = CancellationToken::new();
+    let mut child_stream = child
+        .reply(
+            Message::user().with_text("add one"),
+            SessionConfig {
+                id: child_session_id.clone(),
+                schedule_id: None,
+                max_turns: Some(2),
+                retry_config: None,
+            },
+            true,
+            Some(cancel.clone()),
+        )
+        .await?;
+    let original = first_confirmation(&mut child_stream).await?;
+    let raw_id = confirmation_ids(std::slice::from_ref(&original))
+        .pop()
+        .unwrap();
+    let forwarded = prepare_state_machine_subagent_action_required(
+        &child,
+        &child_session_id,
+        &original,
+        &cancel,
+    )
+    .await?;
+    let display_id = confirmation_ids(std::slice::from_ref(&forwarded))
+        .pop()
+        .unwrap();
+    assert!(display_id.starts_with("summon:"));
+    assert_ne!(display_id, raw_id);
+    assert_eq!(raw_id, "raw-child-request");
+
+    let action_required = child.config.session_manager.action_required();
+    let mut parent_events = action_required
+        .register_action_required_stream(parent_session_id.clone(), "delegate".to_string())
+        .await;
+    action_required.forward_action_required(&parent_session_id, "delegate", forwarded)?;
+    let parent_event = tokio::time::timeout(Duration::from_secs(1), parent_events.recv())
+        .await?
+        .expect("parent action-required event");
+    assert_eq!(confirmation_ids(&[parent_event]), vec![display_id.clone()]);
+
+    parent
+        .submit_tool_confirmation(&parent_session_id, &display_id, permission.clone())
+        .await?;
+    let persisted = child
+        .config
+        .session_manager
+        .get_session(&child_session_id, true)
+        .await?;
+    assert!(persisted
+        .conversation
+        .as_ref()
+        .expect("child conversation")
+        .messages()
+        .iter()
+        .flat_map(|message| &message.content)
+        .any(|content| matches!(content, MessageContent::ActionRequired(action)
+            if matches!(&action.data, ActionRequiredData::ToolConfirmationResponse { id, permission: recorded }
+                if id == &raw_id && recorded == &permission))));
+
+    let result =
+        tokio::time::timeout(Duration::from_secs(15), stream_messages(child_stream)).await??;
+    assert!(result.iter().any(|message| message.is_tool_response()));
+    assert_eq!(calculator.total(), expected_total);
+    assert!(parent
+        .submit_tool_confirmation(&parent_session_id, &display_id, permission)
+        .await
+        .is_err());
+    assert!(parent
+        .submit_tool_confirmation(&parent_session_id, &raw_id, Permission::AllowOnce)
+        .await
+        .is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn state_machine_child_approval_relay_allows_and_resumes() -> Result<()> {
+    relay_approval_case(Permission::AllowOnce, 1).await
+}
+
+#[tokio::test]
+async fn state_machine_child_approval_relay_denies_without_execution() -> Result<()> {
+    relay_approval_case(Permission::DenyOnce, 0).await
+}
+
+#[tokio::test]
+async fn cancelled_state_machine_child_rejects_stale_approval() -> Result<()> {
+    let _guard = env_lock::lock_env([("GOOSE_STATE_MACHINE", Some("1"))]);
+    let (parent, child, api, parent_session_id, child_session_id, calculator, _temp_dir) =
+        relay_fixture().await?;
+    api.on("add one")
+        .calls([("raw-child-request", ADD, value(1))]);
+    let cancel = CancellationToken::new();
+    let mut child_stream = child
+        .reply(
+            Message::user().with_text("add one"),
+            SessionConfig {
+                id: child_session_id.clone(),
+                schedule_id: None,
+                max_turns: Some(2),
+                retry_config: None,
+            },
+            true,
+            Some(cancel.clone()),
+        )
+        .await?;
+    let original = first_confirmation(&mut child_stream).await?;
+    let forwarded = prepare_state_machine_subagent_action_required(
+        &child,
+        &child_session_id,
+        &original,
+        &cancel,
+    )
+    .await?;
+    let display_id = confirmation_ids(&[forwarded]).pop().unwrap();
+    cancel.cancel();
+    assert!(parent
+        .submit_tool_confirmation(&parent_session_id, &display_id, Permission::AllowOnce)
+        .await
+        .is_err());
+    assert_eq!(calculator.total(), 0);
+    assert!(parent
+        .submit_tool_confirmation(&parent_session_id, &display_id, Permission::AllowOnce)
+        .await
+        .is_err());
+    drop(child_stream);
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_children_with_reused_raw_ids_route_independently() -> Result<()> {
+    let _guard = env_lock::lock_env([("GOOSE_STATE_MACHINE", Some("1"))]);
+    let (parent, first_child, api, parent_session_id, first_session_id, first_calculator, temp_dir) =
+        relay_fixture().await?;
+    let sessions = first_child.config.session_manager.clone();
+    let second_session = sessions
+        .create_session(
+            temp_dir.path().to_path_buf(),
+            "second child".to_string(),
+            SessionType::SubAgent,
+            GooseMode::Approve,
+        )
+        .await?;
+    let mut second_config = first_child.config.clone();
+    second_config.is_subagent = true;
+    let second_child = Arc::new(Agent::with_config(second_config));
+    second_child
+        .update_provider(
+            first_child.provider().await?,
+            ModelConfig::new(goose_providers::openai::OPEN_AI_DEFAULT_MODEL)
+                .with_canonical_limits("openai"),
+            &second_session.id,
+        )
+        .await?;
+    second_child
+        .update_goose_mode(GooseMode::Approve, &second_session.id)
+        .await?;
+    let second_calculator = Arc::new(CalculatorExtension::new(sessions.action_required()));
+    second_child
+        .extension_manager
+        .add_client(
+            "calculator".to_string(),
+            ExtensionConfig::Platform {
+                name: "calculator".to_string(),
+                description: "Stateful test calculator".to_string(),
+                display_name: None,
+                bundled: None,
+                available_tools: vec![],
+            },
+            second_calculator.clone(),
+            second_calculator.get_info().cloned(),
+        )
+        .await;
+
+    api.on("first task")
+        .calls([("reused-raw-id", ADD, value(1))]);
+    api.on("second task")
+        .calls([("reused-raw-id", ADD, value(2))]);
+    api.on("result: 1").reply("first complete");
+    api.on(DECLINED_RESPONSE).reply("second denied");
+    let first_cancel = CancellationToken::new();
+    let second_cancel = CancellationToken::new();
+    let mut first_stream = first_child
+        .reply(
+            Message::user().with_text("first task"),
+            SessionConfig {
+                id: first_session_id.clone(),
+                schedule_id: None,
+                max_turns: Some(2),
+                retry_config: None,
+            },
+            true,
+            Some(first_cancel.clone()),
+        )
+        .await?;
+    let first_original = first_confirmation(&mut first_stream).await?;
+    let mut second_stream = second_child
+        .reply(
+            Message::user().with_text("second task"),
+            SessionConfig {
+                id: second_session.id.clone(),
+                schedule_id: None,
+                max_turns: Some(2),
+                retry_config: None,
+            },
+            true,
+            Some(second_cancel.clone()),
+        )
+        .await?;
+    let second_original = first_confirmation(&mut second_stream).await?;
+    let first_raw = confirmation_ids(std::slice::from_ref(&first_original))
+        .pop()
+        .unwrap();
+    let second_raw = confirmation_ids(std::slice::from_ref(&second_original))
+        .pop()
+        .unwrap();
+    assert_eq!(first_raw, second_raw);
+    assert_eq!(first_raw, "reused-raw-id");
+
+    let first_forwarded = prepare_state_machine_subagent_action_required(
+        &first_child,
+        &first_session_id,
+        &first_original,
+        &first_cancel,
+    )
+    .await?;
+    let second_forwarded = prepare_state_machine_subagent_action_required(
+        &second_child,
+        &second_session.id,
+        &second_original,
+        &second_cancel,
+    )
+    .await?;
+    let first_display = confirmation_ids(&[first_forwarded]).pop().unwrap();
+    let second_display = confirmation_ids(&[second_forwarded]).pop().unwrap();
+    assert_ne!(first_display, second_display);
+    assert!(parent
+        .submit_tool_confirmation(&first_session_id, &second_display, Permission::AllowOnce)
+        .await
+        .is_err());
+
+    parent
+        .submit_tool_confirmation(&parent_session_id, &second_display, Permission::DenyOnce)
+        .await?;
+    parent
+        .submit_tool_confirmation(&parent_session_id, &first_display, Permission::AllowOnce)
+        .await?;
+    tokio::time::timeout(Duration::from_secs(15), stream_messages(first_stream)).await??;
+    tokio::time::timeout(Duration::from_secs(15), stream_messages(second_stream)).await??;
+    assert_eq!(first_calculator.total(), 1);
+    assert_eq!(second_calculator.total(), 0);
     Ok(())
 }
 
