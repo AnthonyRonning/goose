@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -18,8 +19,8 @@ use super::tool_confirmation_coordinator::{
 };
 use super::tool_confirmation_router::ToolConfirmationRouter;
 use super::tool_execution::{
-    tool_stream, ToolCallResult, ToolStream, ToolStreamItem, CHAT_MODE_TOOL_SKIPPED_RESPONSE,
-    DECLINED_RESPONSE,
+    schedule_tool_streams, tool_stream, OrderedToolCalls, ToolCallResult, ToolStream,
+    ToolStreamItem, CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE,
 };
 use crate::action_required_manager::ElicitationOutcome;
 use crate::agents::extension::{ExtensionConfig, ExtensionResult};
@@ -228,6 +229,7 @@ pub struct AgentConfig {
     /// to the parent agent reach the subagent that awaits them.
     pub tool_confirmation_router: Option<ToolConfirmationRouter>,
     pub confirmation_session_id: Option<String>,
+    pub ordered_tool_calls: Option<OrderedToolCalls>,
 }
 
 impl AgentConfig {
@@ -254,6 +256,7 @@ impl AgentConfig {
             is_subagent: false,
             tool_confirmation_router: None,
             confirmation_session_id: None,
+            ordered_tool_calls: None,
         }
     }
 
@@ -272,6 +275,23 @@ impl AgentConfig {
 
     pub fn with_use_login_shell_path(mut self, use_login_shell_path: bool) -> Self {
         self.use_login_shell_path = Some(use_login_shell_path);
+        self
+    }
+
+    /// Run these exact extension tool names (including aliases) sequentially in
+    /// provider order within each dispatched batch. Frontend tools and platform
+    /// operations handled before batch dispatch are outside this policy. Other
+    /// tools retain their normal concurrency. The group waits for all of its
+    /// pending approvals before execution, including across state-machine resumes.
+    /// The bound includes the active call; overflow returns a tool error without
+    /// polling the tool body. This does not change permission checks or tool
+    /// discovery, and is not a cross-session or cross-batch execution lock.
+    pub fn with_ordered_tool_calls(
+        mut self,
+        tool_names: impl IntoIterator<Item = String>,
+        max_calls: NonZeroUsize,
+    ) -> Self {
+        self.ordered_tool_calls = Some(OrderedToolCalls::new(tool_names, max_calls));
         self
     }
 
@@ -1742,6 +1762,7 @@ impl Agent {
                 &self.current_goose_mode,
                 self.extension_manager.clone(),
                 self.hook_manager.clone(),
+                self.config.ordered_tool_calls.as_ref(),
             )),
             Arc::new(UnknownToolOperation::new(self.hook_manager.clone())),
             Arc::new(RetryOperation::new(
@@ -2980,14 +3001,12 @@ impl Agent {
                                         }
                                     }
 
-                                    let with_id = tool_futures
-                                        .into_iter()
-                                        .map(|(request_id, stream)| {
-                                            stream.map(move |item| (request_id.clone(), item))
-                                        })
-                                        .collect::<Vec<_>>();
-
-                                    let mut combined = stream::select_all(with_id);
+                                    let mut combined = schedule_tool_streams(
+                                        tool_futures,
+                                        &tool_requests,
+                                        self.config.ordered_tool_calls.as_ref(),
+                                        cancel_token.clone().unwrap_or_default(),
+                                    );
                                     let mut all_install_successful = true;
 
                                     loop {
